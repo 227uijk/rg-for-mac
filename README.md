@@ -1,6 +1,8 @@
 # RG For Mac
 
-一个替代锐捷（Ruijie/RG-SU）官方客户端的 macOS 802.1X 有线认证工具。菜单栏点一下就能连。
+华南农业大学有线校园网的 macOS 802.1X 认证工具，替代锐捷（Ruijie/RG-SU）官方客户端，菜单栏点一下就能连。
+
+> 目前只在华南农业大学验证过。其他学校即使也用锐捷，认证参数（`ServiceHex`、`VersionString` 等）大概率不一样，直接用大概率连不上，需要按下面"适配你自己的校园网"那节自己抓包对比、调整参数。
 
 <p align="center"><img src="docs/menu-bar.png" width="360" alt="菜单栏截图"></p>
 
