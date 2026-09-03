@@ -1,0 +1,13 @@
+.DS_Store
+.build-trash/
+.clang-module-cache/
+
+# 真实抓包/认证日志——里面有账号信息，只保留目录结构
+captures/*
+logs/*
+!captures/.gitkeep
+!logs/.gitkeep
+
+# 编译产物
+minieap
+RG For Mac.app/
