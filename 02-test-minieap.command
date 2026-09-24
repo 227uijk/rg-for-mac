@@ -49,10 +49,11 @@ sleep 2
 {
   echo "time=$(date '+%F %T')"
   echo "iface=$IFACE"
-  echo "cmd=$MINIEAP --if-impl libpcap --module rjv3 -u $USERNAME -p ****** -n $IFACE -a 1 -d 0 --heartbeat 30"
+  echo "cmd=$MINIEAP --if-impl libpcap --module rjv3 -u $USERNAME --password-env MINIEAP_PASSWORD -n $IFACE -a 1 -d 0 --heartbeat 30"
   echo
-  sudo "$MINIEAP" --if-impl libpcap --module rjv3 \
-    -u "$USERNAME" -p "$CAMPUS_PASSWORD" -n "$IFACE" \
+  # 密码走环境变量，不放进命令行参数（否则 ps 能看到）
+  MINIEAP_PASSWORD="$CAMPUS_PASSWORD" sudo --preserve-env=MINIEAP_PASSWORD "$MINIEAP" --if-impl libpcap --module rjv3 \
+    -u "$USERNAME" --password-env MINIEAP_PASSWORD -n "$IFACE" \
     -a 1 -d 0 --heartbeat 30
   echo
   echo "exit_status=$?"

@@ -20,8 +20,15 @@ static NSString * const VersionString = @"RG-SU For Mac V1.35";
 static NSString * const DNS1 = @"114.114.114.114";
 static NSString * const DNS2 = @"114.114.115.115";
 static NSString * const PrefSelectedInterface = @"selected-interface";
-static const NSInteger kMaxAutoRetries = 3;
-static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server time to clear the stale prior session
+// Retrying now happens inside minieap itself: it already holds root, so a retry
+// no longer needs another administrator prompt the way relaunching it would.
+// Timeouts (no server reply, e.g. cable out) retry forever; outright rejections
+// stop after this many so a wrong password cannot hammer the server all night.
+static const NSInteger kMiniEAPMaxFailures = 10;
+static const NSInteger kMiniEAPWaitAfterFailSeconds = 25; // Give the server time to clear the stale prior session
+// Status ticks between full rescans of the interface list, as a safety net for
+// changes the SCDynamicStore notification might miss.
+static const NSInteger kInterfaceRescanTicks = 20;
 
 @interface NetworkInterfaceInfo : NSObject
 @property(nonatomic, copy) NSString *bsdName;
@@ -165,9 +172,12 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
 @property(nonatomic, copy) NSString *activeInterfaceName;
 @property(nonatomic, assign) BOOL userWantsConnected;
 @property(nonatomic, assign) BOOL wasRunningLastTick;
-@property(nonatomic, assign) NSInteger autoRetryCount;
-@property(nonatomic, assign) BOOL autoRetryScheduled;
+@property(nonatomic, assign) BOOL interfaceCacheValid;
+@property(nonatomic, assign) NSInteger ticksSinceInterfaceScan;
+@property(nonatomic, strong) NSDate *lastWakeDate;
+@property(nonatomic, assign) SCDynamicStoreRef dynamicStore;
 - (void)stopAuthThenQuit:(BOOL)quitAfterStop force:(BOOL)force;
+- (void)systemNetworkChanged;
 @end
 
 @implementation AppDelegate
@@ -178,6 +188,7 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
     [self rotateLogsIfNeeded];
     [self buildMenu];
     [self refreshInterfaceList];
+    [self observeSystemChanges];
     [self updateStatus];
 
     self.timer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(updateStatus) userInfo:nil repeats:YES];
@@ -200,6 +211,10 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
 
 - (NSString *)pidFile {
     return [[self supportDir] stringByAppendingPathComponent:@"minieap.pid"];
+}
+
+- (NSString *)passwordFile {
+    return [[self supportDir] stringByAppendingPathComponent:@"minieap.secret"];
 }
 
 - (NSString *)onlineMarkerFile {
@@ -336,19 +351,60 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
 }
 
 - (void)refreshInterfaceList {
-    NSString *savedIface = [[NSUserDefaults standardUserDefaults] stringForKey:PrefSelectedInterface] ?: @"auto";
-    NetworkInterfaceInfo *best = [NetworkHelper bestEthernetInterfaceWithPreferred:savedIface];
-    self.activeInterfaceName = best ? best.bsdName : nil;
+    self.interfaceCacheValid = NO;
+    [self effectiveInterfaceName];
 }
 
+// Scanning every interface (SCNetworkInterfaceCopyAll + ioctl + getifaddrs each)
+// is too much for a 3s tick, so the pick is cached and only redone when the
+// system says links changed, after wake, or every kInterfaceRescanTicks ticks.
 - (NSString *)effectiveInterfaceName {
-    NSString *savedIface = [[NSUserDefaults standardUserDefaults] stringForKey:PrefSelectedInterface] ?: @"auto";
-    NetworkInterfaceInfo *best = [NetworkHelper bestEthernetInterfaceWithPreferred:savedIface];
-    if (best) {
+    if (!self.interfaceCacheValid) {
+        NSString *savedIface = [[NSUserDefaults standardUserDefaults] stringForKey:PrefSelectedInterface] ?: @"auto";
+        NetworkInterfaceInfo *best = [NetworkHelper bestEthernetInterfaceWithPreferred:savedIface];
         self.activeInterfaceName = best.bsdName;
-        return best.bsdName;
+        self.interfaceCacheValid = YES;
+        self.ticksSinceInterfaceScan = 0;
     }
-    return nil;
+    return self.activeInterfaceName;
+}
+
+static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys, void *info) {
+    AppDelegate *delegate = (__bridge AppDelegate *)info;
+    [delegate systemNetworkChanged];
+}
+
+- (void)observeSystemChanges {
+    [[NSWorkspace sharedWorkspace].notificationCenter addObserver:self
+                                                         selector:@selector(systemDidWake:)
+                                                             name:NSWorkspaceDidWakeNotification
+                                                           object:nil];
+
+    SCDynamicStoreContext context = {0, (__bridge void *)self, NULL, NULL, NULL};
+    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("RGForMac"), DynamicStoreChanged, &context);
+    if (!store) {
+        return;
+    }
+    NSArray *keys = @[@"State:/Network/Interface"];
+    NSArray *patterns = @[@"State:/Network/Interface/[^/]+/Link", @"State:/Network/Interface/[^/]+/IPv4"];
+    SCDynamicStoreSetNotificationKeys(store, (__bridge CFArrayRef)keys, (__bridge CFArrayRef)patterns);
+    CFRunLoopSourceRef source = SCDynamicStoreCreateRunLoopSource(NULL, store, 0);
+    if (source) {
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+        CFRelease(source);
+    }
+    self.dynamicStore = store;
+}
+
+- (void)systemNetworkChanged {
+    self.interfaceCacheValid = NO;
+    [self updateStatus];
+}
+
+- (void)systemDidWake:(NSNotification *)notification {
+    self.lastWakeDate = [NSDate date];
+    self.interfaceCacheValid = NO;
+    [self updateStatus];
 }
 
 - (void)rotateLogsIfNeeded {
@@ -380,17 +436,18 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
 }
 
 - (void)updateStatus {
-    BOOL isRunningNow = [self miniEAPRunning];
-    BOOL isOnlineNow = isRunningNow && [self miniEAPOnline];
+    pid_t pid = [self miniEAPProcessID];
+    BOOL isRunningNow = pid > 0;
+    BOOL isOnlineNow = isRunningNow && [self onlineMarkerPresent];
     if (self.starting && isRunningNow) {
         self.starting = NO;
-    }
-    if (isOnlineNow) {
-        self.autoRetryCount = 0;
     }
     [self handlePossibleUnexpectedExitWithRunning:isRunningNow];
     self.wasRunningLastTick = isRunningNow;
 
+    if (++self.ticksSinceInterfaceScan >= kInterfaceRescanTicks) {
+        self.interfaceCacheValid = NO;
+    }
     NSString *iface = [self effectiveInterfaceName];
     NSString *ip = iface ? [NetworkHelper getIPv4AddressForInterface:iface] : nil;
     self.ifaceItemText.title = [NSString stringWithFormat:@"网卡：%@%@", iface ?: @"无", ip ? [NSString stringWithFormat:@" (%@)", ip] : @""];
@@ -409,15 +466,8 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
         self.stopItem.enabled = NO;
         return;
     }
-    if (self.autoRetryScheduled) {
-        self.statusItemText.title = [NSString stringWithFormat:@"状态：认证异常，准备第 %ld 次自动重试…", (long)self.autoRetryCount];
-        self.statusItem.button.title = @"RG…";
-        self.startItem.enabled = NO;
-        self.stopItem.enabled = YES;
-        return;
-    }
 
-    self.statusItemText.title = isOnlineNow ? [NSString stringWithFormat:@"状态：已连接 (PID: %@)", [self miniEAPPID]]
+    self.statusItemText.title = isOnlineNow ? [NSString stringWithFormat:@"状态：已连接 (PID: %d)", (int)pid]
                                : isRunningNow ? @"状态：正在认证中…"
                                : @"状态：未连接";
     self.statusItem.button.title = isOnlineNow ? @"RG✓" : (isRunningNow ? @"RG…" : @"RG");
@@ -425,65 +475,60 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
     self.stopItem.enabled = isRunningNow;
 }
 
-// minieap exits on its own after exhausting retries against the auth server
-// (common right after a previous session was torn down and the server hasn't
-// expired it yet). Without this, the app just silently falls back to "未连接"
-// and the user has to notice and click 连接 again by hand.
+// minieap retries on its own now, so it only exits by itself once the server
+// has rejected it kMiniEAPMaxFailures times in a row (or the interface vanished).
+// Relaunching from here would cost another administrator prompt each time, so
+// tell the user instead - except right after wake, when they are at the machine
+// anyway and the exit was most likely the sleep itself.
 - (void)handlePossibleUnexpectedExitWithRunning:(BOOL)isRunningNow {
     BOOL diedOnItsOwn = self.wasRunningLastTick && !isRunningNow
-        && !self.starting && !self.stopping && !self.autoRetryScheduled;
+        && !self.starting && !self.stopping;
     if (!diedOnItsOwn || !self.userWantsConnected) {
         return;
     }
-    if (self.autoRetryCount >= kMaxAutoRetries) {
-        self.autoRetryCount = 0;
-        self.userWantsConnected = NO;
-        [self showMessage:[NSString stringWithFormat:@"自动重试 %ld 次仍未连接，请检查网线、账号密码，或手动点击“连接”重试。", (long)kMaxAutoRetries]];
+    BOOL justWoke = self.lastWakeDate && -[self.lastWakeDate timeIntervalSinceNow] < 60.0;
+    if (justWoke) {
+        self.lastWakeDate = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self startAuthWithNetworkRepair:YES];
+        });
         return;
     }
-    self.autoRetryCount += 1;
-    self.autoRetryScheduled = YES;
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoRetryDelaySeconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        strongSelf.autoRetryScheduled = NO;
-        if (!strongSelf.userWantsConnected || [strongSelf miniEAPRunning]) {
-            return; // User already intervened manually in the meantime
-        }
-        [strongSelf startAuthWithNetworkRepair:NO];
+    self.userWantsConnected = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self showMessage:@"认证进程多次重试后已退出，请检查网线和账号密码（菜单里“打开日志文件夹”可以看到服务器返回的原因），然后手动点“启动认证”。"];
     });
 }
 
-- (NSString *)miniEAPPID {
+- (pid_t)pidFromPidFile {
     int open_flags = O_RDONLY;
 #ifdef O_NOFOLLOW
     open_flags |= O_NOFOLLOW;
 #endif
     int pid_fd = open([self pidFile].fileSystemRepresentation, open_flags);
     if (pid_fd < 0) {
-        return nil;
+        return 0;
     }
     struct stat info;
     if (fstat(pid_fd, &info) != 0 || (info.st_mode & S_IFMT) != S_IFREG) {
         close(pid_fd);
-        return nil;
+        return 0;
     }
     char pid_buffer[32];
     ssize_t length = read(pid_fd, pid_buffer, sizeof(pid_buffer) - 1);
     close(pid_fd);
     if (length <= 0) {
-        return nil;
+        return 0;
     }
     pid_buffer[length] = '\0';
     NSString *pidText = [[NSString alloc] initWithBytes:pid_buffer length:(NSUInteger)length encoding:NSUTF8StringEncoding];
     NSString *trimmed = [pidText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0
         || [trimmed rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location != NSNotFound) {
-        return nil;
+        return 0;
     }
     NSInteger pid = trimmed.integerValue;
-    return pid > 0 ? [NSString stringWithFormat:@"%ld", (long)pid] : nil;
+    return (pid > 0 && pid <= INT_MAX) ? (pid_t)pid : 0;
 }
 
 // minieap runs as root (started via "administrator privileges"), while this app
@@ -493,33 +538,31 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
 // happily authenticated in the background. sysctl(KERN_PROC_PID) reads the same
 // public process-table info the standard process-listing tools use, and works
 // across the privilege gap without shelling out to any of them.
-- (BOOL)miniEAPRunning {
-    NSString *pidStr = [self miniEAPPID];
-    if (pidStr.length == 0) {
-        return NO;
-    }
-    pid_t pid = (pid_t)[pidStr integerValue];
+// Returns minieap's PID, or 0 when it is not running.
+- (pid_t)miniEAPProcessID {
+    pid_t pid = [self pidFromPidFile];
     if (pid <= 0) {
-        return NO;
+        return 0;
     }
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
     struct kinfo_proc info;
     size_t len = sizeof(info);
     memset(&info, 0, sizeof(info));
     if (sysctl(mib, 4, &info, &len, NULL, 0) != 0 || len == 0) {
-        return NO;
+        return 0;
     }
-    return strcmp(info.kp_proc.p_comm, "minieap") == 0;
+    return strcmp(info.kp_proc.p_comm, "minieap") == 0 ? pid : 0;
+}
+
+- (BOOL)miniEAPRunning {
+    return [self miniEAPProcessID] > 0;
 }
 
 // A process being alive only means it is negotiating (or retrying); minieap only
 // touches this marker once EAP-Success actually lands, and removes it the moment
 // it is no longer sure it is online. Always pair with -miniEAPRunning: a stale
 // marker from a killed process is harmless once the PID check already says "dead".
-- (BOOL)miniEAPOnline {
-    if (![self miniEAPRunning]) {
-        return NO;
-    }
+- (BOOL)onlineMarkerPresent {
     int open_flags = O_RDONLY;
 #ifdef O_NOFOLLOW
     open_flags |= O_NOFOLLOW;
@@ -535,12 +578,10 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
 }
 
 - (void)startAuth {
-    self.autoRetryCount = 0;
     [self startAuthWithNetworkRepair:NO];
 }
 
 - (void)autoStartIfNeeded {
-    self.autoRetryCount = 0;
     if (![self miniEAPRunning]) {
         [self startAuthWithNetworkRepair:NO];
     } else {
@@ -550,7 +591,6 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
 }
 
 - (void)repairAndReconnect {
-    self.autoRetryCount = 0;
     [self startAuthWithNetworkRepair:YES];
 }
 
@@ -582,6 +622,10 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
         [self showMessage:@"未检测到任何以太网接口，请先插上网线或外接网卡/扩展坞后再试。"];
         return;
     }
+    if (![self isSafeInterfaceName:iface]) {
+        [self showMessage:[NSString stringWithFormat:@"网卡名 %@ 含有异常字符，已拒绝启动认证。", iface]];
+        return;
+    }
 
     NSDictionary *credentials = [self credentialsOrPrompt];
     if (!credentials) {
@@ -589,13 +633,18 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
         return;
     }
 
+    if (![self writePasswordFile:credentials[@"password"]]) {
+        [self showMessage:@"无法写入临时密码文件，未启动认证。"];
+        return;
+    }
+
     [self markStarting];
-    NSString *user = credentials[@"username"];
-    NSString *password = credentials[@"password"];
-    NSString *command = [self startCommandWithUser:user password:password interface:iface repairNetwork:repairNetwork];
+    NSString *command = [self startCommandWithUser:credentials[@"username"] interface:iface repairNetwork:repairNetwork];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSDictionary *result = [self runAdminShell:command];
+        // The root script deletes it after reading; this covers a cancelled prompt.
+        unlink([self passwordFile].fileSystemRepresentation);
         BOOL running = [self waitForMiniEAPRunningWithTimeout:(repairNetwork ? 8.0 : 4.0)];
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -696,27 +745,10 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
         pidFilePath];
 }
 
-- (void)recoverFromLongStart {
-    if (!self.starting) {
-        return;
-    }
-    if ([self miniEAPRunning]) {
-        return;
-    }
-    self.statusItemText.title = @"状态：等待系统授权或认证响应";
-}
-
-- (void)startLongStartWatchdog {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self recoverFromLongStart];
-    });
-}
-
 - (void)markStarting {
     self.starting = YES;
     self.lastStartError = nil;
     [self updateStatus];
-    [self startLongStartWatchdog];
 }
 
 - (BOOL)waitForMiniEAPRunningWithTimeout:(NSTimeInterval)timeout {
@@ -750,8 +782,11 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
     if (!credentials) {
         return;
     }
-    [self saveValue:credentials[@"username"] account:@"campus-username"];
-    [self saveValue:credentials[@"password"] account:@"campus-password"];
+    OSStatus status = [self saveCredentials:credentials];
+    if (status != errSecSuccess) {
+        [self showMessage:[NSString stringWithFormat:@"保存到钥匙串失败（错误码 %d），账号密码没有更新。", (int)status]];
+        return;
+    }
     [self showMessage:@"校园网账号密码已保存到 macOS 钥匙串。"];
 }
 
@@ -777,8 +812,10 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
     if (!credentials) {
         return nil;
     }
-    [self saveValue:credentials[@"username"] account:@"campus-username"];
-    [self saveValue:credentials[@"password"] account:@"campus-password"];
+    OSStatus status = [self saveCredentials:credentials];
+    if (status != errSecSuccess) {
+        [self showMessage:[NSString stringWithFormat:@"保存到钥匙串失败（错误码 %d），本次仍会用刚输入的账号密码连接，下次需要重新输入。", (int)status]];
+    }
     return credentials;
 }
 
@@ -807,31 +844,70 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
     return @{@"username": userField.stringValue, @"password": passField.stringValue};
 }
 
-- (NSString *)startCommandWithUser:(NSString *)user password:(NSString *)password interface:(NSString *)iface repairNetwork:(BOOL)repairNetwork {
+- (BOOL)isSafeInterfaceName:(NSString *)iface {
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
+        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"];
+    return iface.length > 0 && iface.length < IFNAMSIZ
+        && [iface rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
+// Hands the password to the root script through a 0600 file instead of the
+// osascript command line, where any local user could catch it with `ps`.
+- (BOOL)writePasswordFile:(NSString *)password {
+    NSData *data = [password dataUsingEncoding:NSUTF8StringEncoding];
+    const char *path = [self passwordFile].fileSystemRepresentation;
+    unlink(path);
+    int open_flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+    open_flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, open_flags, 0600);
+    if (fd < 0) {
+        return NO;
+    }
+    BOOL ok = write(fd, data.bytes, data.length) == (ssize_t)data.length;
+    close(fd);
+    if (!ok) {
+        unlink(path);
+    }
+    return ok;
+}
+
+- (NSString *)startCommandWithUser:(NSString *)user interface:(NSString *)iface repairNetwork:(BOOL)repairNetwork {
+    NSString *quotedIface = [self shellQuote:iface];
     NSString *networkRepairPrefix = repairNetwork ? [NSString stringWithFormat:
         @"/usr/sbin/ipconfig set %@ DHCP >/dev/null 2>&1 || true\n"
          "/bin/sleep 0.3\n",
-        iface
+        quotedIface
     ] : @"";
-    
+    NSString *passwordFile = [self shellQuote:[self passwordFile]];
+    NSString *dhcpScript = [NSString stringWithFormat:@"/usr/sbin/ipconfig set %@ DHCP", quotedIface];
+
     // 启动前先无条件清理旧进程，防止冲突
     NSString *command = [NSString stringWithFormat:
         @"%@"
         "%@"
-        "export MINIEAP_PASSWORD=%@\n"
+        "MINIEAP_PASSWORD=''\n"
+        "if [ -f %@ ] && [ ! -L %@ ]; then IFS= read -r MINIEAP_PASSWORD < %@ || true; fi\n"
+        "/bin/rm -f %@\n"
+        "if [ -z \"$MINIEAP_PASSWORD\" ]; then echo '无法读取临时密码文件' >&2; exit 1; fi\n"
+        "export MINIEAP_PASSWORD\n"
         "export MINIEAP_REQUIRE_EXISTING_FILES=1\n"
-        "%@ --if-impl libpcap --module rjv3 -u %@ --password-env MINIEAP_PASSWORD -n %@ -a 1 -d 2 --heartbeat 30 --version-str %@ --rj-option %@ --fake-dns1 %@ --fake-dns2 %@ --dhcp-script '/usr/sbin/ipconfig set %@ DHCP' --daemonize 3 --log-file %@ --pid-file %@ --conf-file /dev/null >/dev/null 2>&1 &\n",
+        "%@ --if-impl libpcap --module rjv3 -u %@ --password-env MINIEAP_PASSWORD -n %@ -a 1 -d 2 --heartbeat 30 --max-fail %ld --max-retries 0 --wait-after-fail %ld --version-str %@ --rj-option %@ --fake-dns1 %@ --fake-dns2 %@ --dhcp-script %@ --daemonize 3 --log-file %@ --pid-file %@ --conf-file /dev/null >/dev/null 2>&1 &\n",
         [self stopCommand],
         networkRepairPrefix,
-        [self shellQuote:password],
+        passwordFile, passwordFile, passwordFile,
+        passwordFile,
         [self shellQuote:[self minieapPath]],
         [self shellQuote:user],
-        iface,
+        quotedIface,
+        (long)kMiniEAPMaxFailures,
+        (long)kMiniEAPWaitAfterFailSeconds,
         [self shellQuote:VersionString],
         [self shellQuote:ServiceHex],
-        DNS1,
+        [self shellQuote:DNS1],
         [self shellQuote:DNS2],
-        iface,
+        [self shellQuote:dhcpScript],
         [self shellQuote:[self logFile]],
         [self shellQuote:[self pidFile]]
     ];
@@ -843,15 +919,14 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
     NSTask *task = [[NSTask alloc] init];
     NSPipe *outputPipe = [NSPipe pipe];
     NSPipe *errorPipe = [NSPipe pipe];
-    task.launchPath = @"/usr/bin/osascript";
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
     task.arguments = @[@"-e", script];
     task.standardOutput = outputPipe;
     task.standardError = errorPipe;
 
-    @try {
-        [task launch];
-    } @catch (NSException *exception) {
-        return @{@"ok": @NO, @"message": exception.reason ?: @"无法启动 osascript"};
+    NSError *launchError = nil;
+    if (![task launchAndReturnError:&launchError]) {
+        return @{@"ok": @NO, @"message": launchError.localizedDescription ?: @"无法启动 osascript"};
     }
 
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:45.0];
@@ -899,16 +974,29 @@ static const NSTimeInterval kAutoRetryDelaySeconds = 25.0; // Give the server ti
     return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
 }
 
-- (void)saveValue:(NSString *)value account:(NSString *)account {
+- (OSStatus)saveValue:(NSString *)value account:(NSString *)account {
     NSDictionary *query = @{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecAttrService: KeychainService,
         (__bridge id)kSecAttrAccount: account
     };
-    SecItemDelete((__bridge CFDictionaryRef)query);
-    NSMutableDictionary *attrs = [query mutableCopy];
-    attrs[(__bridge id)kSecValueData] = [value dataUsingEncoding:NSUTF8StringEncoding];
-    SecItemAdd((__bridge CFDictionaryRef)attrs, NULL);
+    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
+    NSDictionary *update = @{(__bridge id)kSecValueData: data};
+    OSStatus status = SecItemUpdate((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)update);
+    if (status == errSecItemNotFound) {
+        NSMutableDictionary *attrs = [query mutableCopy];
+        attrs[(__bridge id)kSecValueData] = data;
+        status = SecItemAdd((__bridge CFDictionaryRef)attrs, NULL);
+    }
+    return status;
+}
+
+- (OSStatus)saveCredentials:(NSDictionary *)credentials {
+    OSStatus status = [self saveValue:credentials[@"username"] account:@"campus-username"];
+    if (status != errSecSuccess) {
+        return status;
+    }
+    return [self saveValue:credentials[@"password"] account:@"campus-password"];
 }
 
 - (void)showMessage:(NSString *)message {

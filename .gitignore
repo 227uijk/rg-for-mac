@@ -10,4 +10,8 @@ logs/*
 
 # 编译产物
 minieap
+*.o
+*.d
+*.d-e
+minieap-src/tests/test_pid_lock
 RG For Mac.app/

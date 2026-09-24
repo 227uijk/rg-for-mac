@@ -1,0 +1,24 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: minieap unit tests
+        run: make -C minieap-src test
+      - name: Build app
+        run: ./RGForMacApp/build.sh
+      - name: Check app bundle
+        run: ./RGForMacApp/tests/test_app_bundle.sh
+      # zip keeps the executable bits and signature that a plain folder upload loses
+      - name: Package
+        run: ditto -c -k --keepParent "RG For Mac.app" RG-For-Mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RG-For-Mac
+          path: RG-For-Mac.zip

@@ -49,7 +49,12 @@ minieap: $(BUILD_MODULES)
 
 .PHONY: clean
 clean:
-	rm -f minieap.service minieap.1.gz
+	rm -f minieap.service minieap.1.gz tests/test_pid_lock
+
+.PHONY: test
+test:
+	$(CC) -Wall -Iinclude -o tests/test_pid_lock tests/test_pid_lock.c util/pid_lock.c
+	./tests/test_pid_lock
 
 define my-dir
 $(dir $(lastword $(MAKEFILE_LIST)))
