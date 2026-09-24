@@ -117,6 +117,7 @@ static void print_cmdline_help() {
 
     PR_RAW("\n\033[1m注意：选项与参数之间必须用空格分开！\033[0m\n");
 
+    fflush(stdout); // _exit skips stdio flushing; help piped into another command would be lost
     _exit(EXIT_SUCCESS);
 }
 
