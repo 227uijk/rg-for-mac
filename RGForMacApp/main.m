@@ -29,6 +29,9 @@ static const NSInteger kMiniEAPWaitAfterFailSeconds = 25; // Give the server tim
 // Status ticks between full rescans of the interface list, as a safety net for
 // changes the SCDynamicStore notification might miss.
 static const NSInteger kInterfaceRescanTicks = 20;
+// USB/Thunderbolt adapters take a moment to come back after wake; reconnecting
+// right away tends to find no interface (or the wrong one).
+static const NSTimeInterval kWakeReconnectDelay = 4.0;
 
 @interface NetworkInterfaceInfo : NSObject
 @property(nonatomic, copy) NSString *bsdName;
@@ -175,6 +178,9 @@ static const NSInteger kInterfaceRescanTicks = 20;
 @property(nonatomic, assign) BOOL interfaceCacheValid;
 @property(nonatomic, assign) NSInteger ticksSinceInterfaceScan;
 @property(nonatomic, strong) NSDate *lastWakeDate;
+@property(nonatomic, assign) BOOL asleep;
+@property(nonatomic, assign) BOOL reconnectOnWake;
+@property(nonatomic, assign) BOOL poweringOff;
 @property(nonatomic, assign) SCDynamicStoreRef dynamicStore;
 - (void)stopAuthThenQuit:(BOOL)quitAfterStop force:(BOOL)force;
 - (void)systemNetworkChanged;
@@ -379,6 +385,14 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
                                                          selector:@selector(systemDidWake:)
                                                              name:NSWorkspaceDidWakeNotification
                                                            object:nil];
+    [[NSWorkspace sharedWorkspace].notificationCenter addObserver:self
+                                                         selector:@selector(systemWillSleep:)
+                                                             name:NSWorkspaceWillSleepNotification
+                                                           object:nil];
+    [[NSWorkspace sharedWorkspace].notificationCenter addObserver:self
+                                                         selector:@selector(systemWillPowerOff:)
+                                                             name:NSWorkspaceWillPowerOffNotification
+                                                           object:nil];
 
     SCDynamicStoreContext context = {0, (__bridge void *)self, NULL, NULL, NULL};
     SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("RGForMac"), DynamicStoreChanged, &context);
@@ -401,10 +415,36 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     [self updateStatus];
 }
 
+- (void)systemWillSleep:(NSNotification *)notification {
+    self.asleep = YES;
+}
+
 - (void)systemDidWake:(NSNotification *)notification {
+    self.asleep = NO;
     self.lastWakeDate = [NSDate date];
     self.interfaceCacheValid = NO;
     [self updateStatus];
+    if (self.reconnectOnWake) {
+        self.reconnectOnWake = NO;
+        [self scheduleWakeReconnect];
+    }
+}
+
+- (void)scheduleWakeReconnect {
+    self.lastWakeDate = nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWakeReconnectDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!self.userWantsConnected || self.starting || self.stopping || [self miniEAPRunning]) {
+            return;
+        }
+        self.interfaceCacheValid = NO;
+        [self startAuthWithNetworkRepair:YES];
+    });
+}
+
+// Logout/shutdown/restart: the system is about to kill minieap anyway, and an
+// administrator prompt here would just make macOS report that we blocked it.
+- (void)systemWillPowerOff:(NSNotification *)notification {
+    self.poweringOff = YES;
 }
 
 - (void)rotateLogsIfNeeded {
@@ -439,9 +479,10 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     pid_t pid = [self miniEAPProcessID];
     BOOL isRunningNow = pid > 0;
     BOOL isOnlineNow = isRunningNow && [self onlineMarkerPresent];
-    if (self.starting && isRunningNow) {
-        self.starting = NO;
-    }
+    // `starting` is cleared only by the start completion handler. During a
+    // repair the *old* minieap is still alive while the admin prompt is up;
+    // clearing it here on seeing that process let the moment the script killed
+    // it look like an unexpected exit ("多次重试后已退出" + auto-connect off).
     [self handlePossibleUnexpectedExitWithRunning:isRunningNow];
     self.wasRunningLastTick = isRunningNow;
 
@@ -450,6 +491,9 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     }
     NSString *iface = [self effectiveInterfaceName];
     NSString *ip = iface ? [NetworkHelper getIPv4AddressForInterface:iface] : nil;
+    // minieap has no way to notice a pulled cable once it is authenticated, so
+    // its online marker would keep saying "已连接" with the cable out.
+    BOOL linkDown = iface && ![NetworkHelper isInterfaceActive:iface];
     self.ifaceItemText.title = [NSString stringWithFormat:@"网卡：%@%@", iface ?: @"无", ip ? [NSString stringWithFormat:@" (%@)", ip] : @""];
 
     if (self.starting) {
@@ -467,10 +511,15 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         return;
     }
 
-    self.statusItemText.title = isOnlineNow ? [NSString stringWithFormat:@"状态：已连接 (PID: %d)", (int)pid]
-                               : isRunningNow ? @"状态：正在认证中…"
-                               : @"状态：未连接";
-    self.statusItem.button.title = isOnlineNow ? @"RG✓" : (isRunningNow ? @"RG…" : @"RG");
+    if (isRunningNow && linkDown) {
+        self.statusItemText.title = @"状态：网线未连接";
+        self.statusItem.button.title = @"RG…";
+    } else {
+        self.statusItemText.title = isOnlineNow ? [NSString stringWithFormat:@"状态：已连接 (PID: %d)", (int)pid]
+                                   : isRunningNow ? @"状态：正在认证中…"
+                                   : @"状态：未连接";
+        self.statusItem.button.title = isOnlineNow ? @"RG✓" : (isRunningNow ? @"RG…" : @"RG");
+    }
     self.startItem.enabled = !isRunningNow;
     self.stopItem.enabled = isRunningNow;
 }
@@ -486,12 +535,16 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     if (!diedOnItsOwn || !self.userWantsConnected) {
         return;
     }
+    // The exit can be noticed before the wake notification arrives (a timer or
+    // link-change callback firing first on wake, or during a dark wake), so an
+    // exit seen while still "asleep" waits for the wake instead of alerting.
+    if (self.asleep) {
+        self.reconnectOnWake = YES;
+        return;
+    }
     BOOL justWoke = self.lastWakeDate && -[self.lastWakeDate timeIntervalSinceNow] < 60.0;
     if (justWoke) {
-        self.lastWakeDate = nil;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self startAuthWithNetworkRepair:YES];
-        });
+        [self scheduleWakeReconnect];
         return;
     }
     self.userWantsConnected = NO;
@@ -650,15 +703,25 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         dispatch_async(dispatch_get_main_queue(), ^{
             BOOL stopAfterStart = self.stopRequestedWhileStarting;
             BOOL quitAfterStop = self.terminatingAfterStop;
+            self.starting = NO;
+            // Baseline for the next tick's exit detection is the process we
+            // just launched, not whatever an earlier tick saw before the start.
+            self.wasRunningLastTick = running;
             if (running) {
                 self.lastStartError = nil;
-            } else if ([result[@"ok"] boolValue]) {
+            } else if (stopAfterStart) {
                 self.lastStartError = nil;
+            } else if ([result[@"ok"] boolValue]) {
+                // The script only backgrounds minieap, so "ok" says nothing about
+                // whether it survived its own startup (bad interface, pcap error).
+                self.lastStartError = @"认证进程启动后立即退出";
+                self.userWantsConnected = NO;
+                [self showMessage:@"认证进程启动后立即退出了，请在菜单里“打开日志文件夹”查看原因。"];
             } else {
                 self.lastStartError = result[@"message"] ?: @"未知错误";
+                self.userWantsConnected = NO;
                 [self showMessage:[NSString stringWithFormat:@"启动暂未成功：%@", self.lastStartError]];
             }
-            self.starting = NO;
             if (stopAfterStart) {
                 self.stopRequestedWhileStarting = NO;
                 [self stopAuthThenQuit:quitAfterStop force:YES];
@@ -795,7 +858,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
-    if (self.terminatingAfterStop && !self.starting && !self.stopping) {
+    if (self.poweringOff || (self.terminatingAfterStop && !self.starting && !self.stopping)) {
         return NSTerminateNow;
     }
     [self stopAuthThenQuit:YES];
@@ -929,7 +992,10 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         return @{@"ok": @NO, @"message": launchError.localizedDescription ?: @"无法启动 osascript"};
     }
 
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:45.0];
+    // Long enough for someone who walked away from the admin prompt; killing
+    // osascript does not take the prompt down, so a short limit just left a
+    // dialog that did nothing when finally answered.
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:120.0];
     while (task.isRunning && [[NSDate date] compare:deadline] == NSOrderedAscending) {
         [NSThread sleepForTimeInterval:0.05];
     }
@@ -943,7 +1009,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
             } @catch (__unused NSException *exception) {
             }
         }
-        return @{@"ok": @NO, @"message": @"系统授权或管理员脚本超过 45 秒未返回，已取消本次操作。"};
+        return @{@"ok": @NO, @"message": @"系统授权或管理员脚本超过 2 分钟未返回，已取消本次操作。"};
     }
 
     NSData *stdoutData = [[outputPipe fileHandleForReading] readDataToEndOfFile];

@@ -221,8 +221,15 @@ void eap_state_machine_send_logoff() {
     state_mach_send_eapol_simple(EAPOL_LOGOFF);
 }
 
+// A retry scheduled by a failure; kept so a success that arrives first (the
+// server re-requesting identity on its own) can cancel it instead of letting it
+// fire later and restart an auth that already went through.
+static int g_retry_alarm_id = 0;
+
 static RESULT state_mach_process_success(ETH_EAP_FRAME* frame) {
     PROG_CONFIG* _cfg = get_program_config();
+    unschedule_alarm(g_retry_alarm_id);
+    g_retry_alarm_id = 0;
     if (PRIV->auth_round == _cfg->auth_round) {
         PR_INFO("认证成功");
         pid_lock_mark_online(); // Let outside supervisors know we are truly online now
@@ -238,7 +245,13 @@ static RESULT state_mach_process_success(ETH_EAP_FRAME* frame) {
 }
 
 static void restart_auth(void* unused) {
+    // eap_state_machine_reset() zeroes fail_count, which used to mean every
+    // retry started counting from 0 again and --max-fail could never trigger:
+    // a wrong password kept retrying forever. Only a success clears it now.
+    int _fail_count = PRIV->fail_count;
+    g_retry_alarm_id = 0;
     eap_state_machine_reset();
+    PRIV->fail_count = _fail_count;
     switch_to_state(EAP_STATE_START_SENT, NULL);
 }
 
@@ -262,7 +275,8 @@ static RESULT state_mach_process_failure(ETH_EAP_FRAME* frame) {
             exit(EXIT_FAILURE);
         } else {
             PR_WARN("认证失败 %d 次，将在 %d 秒或服务器请求后重试……", PRIV->fail_count, _cfg->wait_after_fail_secs);
-            schedule_alarm(_cfg->wait_after_fail_secs, restart_auth, NULL);
+            unschedule_alarm(g_retry_alarm_id);
+            g_retry_alarm_id = schedule_alarm(_cfg->wait_after_fail_secs, restart_auth, NULL);
         }
     }
     return SUCCESS;
