@@ -104,6 +104,14 @@ typedef struct _prog_config {
     #define DEFAULT_RESTART_ON_LOGOFF TRUE
 
     /*
+     * Send an EAPOL-Logoff before the very first EAPOL-Start, so a session the
+     * server still holds from a previous run that never logged off (shutdown,
+     * crash, sleep) is cleared instead of "succeeding" into a dead port.
+     */
+    int logoff_before_start;
+    #define DEFAULT_LOGOFF_BEFORE_START FALSE
+
+    /*
      * Wait seconds after failure before next try.
      */
     int wait_after_fail_secs;

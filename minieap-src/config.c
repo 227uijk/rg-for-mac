@@ -43,6 +43,7 @@ void load_default_params() {
     PCFG.pidfile = strdup(DEFAULT_PIDFILE);
     PCFG.logfile = strdup(DEFAULT_LOGFILE);
     PCFG.restart_on_logoff = DEFAULT_RESTART_ON_LOGOFF;
+    PCFG.logoff_before_start = DEFAULT_LOGOFF_BEFORE_START;
     PCFG.wait_after_fail_secs = DEFAULT_WAIT_AFTER_FAIL_SECS;
     PCFG.daemon_type = DEFAULT_DAEMON_TYPE;
     PCFG.max_retries = DEFAULT_MAX_RETRIES;
@@ -97,6 +98,7 @@ static void print_cmdline_help() {
         "\t--wait-after-fail, -r <num>\t认证失败后重新认证前的等待时间（但当服务器要求重新认证时将直接开始认证）[默认" STR(DEFAULT_WAIT_AFTER_FAIL_SECS) "]\n"
         "\t--max-fail, -l <num>\t最大允许认证失败次数 [默认" STR(DEFAULT_MAX_FAILURES) "]\n"
         "\t--no-auto-reauth, -x\t认证掉线后不允许自动重连 [默认" STR(DEFAULT_RESTART_ON_LOGOFF) "]\n"
+        "\t--logoff-first\t首次认证前先发送一次 EAPOL-Logoff，清掉服务器上残留的旧会话 [默认关闭]\n"
         "\t--daemonize, -b <0-3>\t后台运行方式： [默认0]\n"
             "\t\t\t\t0 = 不后台\n"
             "\t\t\t\t1 = 后台运行，关闭输出\n"
@@ -159,6 +161,8 @@ static void parse_one_opt(const char* option, const char* argument) {
         g_prog_config.max_retries = atoi(argument);
     } else if (ISOPT("no-auto-reauth")) {
         g_prog_config.restart_on_logoff = 0;
+    } else if (ISOPT("logoff-first")) {
+        g_prog_config.logoff_before_start = (argument == NULL || atoi(argument) != 0);
     } else if (ISOPT("wait-after-fail")) {
         g_prog_config.wait_after_fail_secs = atoi(argument);
     } else if (ISOPT("stage-timeout")) {
@@ -197,6 +201,7 @@ RESULT parse_cmdline_opts(int argc, char* argv[]) {
 	    { "wait-after-fail", required_argument, NULL, 'r' },
 	    { "max-fail", required_argument, NULL, 'l' },
 	    { "no-auto-reauth", no_argument, NULL, 'x' },
+	    { "logoff-first", no_argument, NULL, 0 },
 	    { "daemonize", required_argument, NULL, 'b' },
 	    { "proxy-lan-iface", required_argument, NULL, 'z' },
 	    { "auth-round", required_argument, NULL, 'j' },
@@ -273,6 +278,7 @@ RESULT save_config_file() {
     conf_parser_add_value("max-fail", my_itoa(g_prog_config.max_failures, itoa_buf, 10));
     conf_parser_add_value("max-retries", my_itoa(g_prog_config.max_retries, itoa_buf, 10));
     conf_parser_add_value("no-auto-reauth", g_prog_config.restart_on_logoff ? "0" : "1");
+    conf_parser_add_value("logoff-first", g_prog_config.logoff_before_start ? "1" : "0");
     conf_parser_add_value("wait-after-fail", my_itoa(g_prog_config.wait_after_fail_secs, itoa_buf, 10));
     conf_parser_add_value("stage-timeout", my_itoa(g_prog_config.stage_timeout, itoa_buf, 10));
     conf_parser_add_value("proxy-lan-iface", g_proxy_config.lan_ifname);

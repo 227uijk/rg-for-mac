@@ -25,5 +25,6 @@ done
 /usr/bin/codesign --verify --deep --strict "$APP" || fail "签名校验失败"
 help_text="$("$MINIEAP" -h 2>&1)" || fail "minieap -h 运行失败"
 [[ "$help_text" == *"--password-env"* ]] || fail "minieap 不支持 --password-env"
+[[ "$help_text" == *"--logoff-first"* ]] || fail "minieap 不支持 --logoff-first"
 
 echo "OK"

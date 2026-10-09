@@ -2,10 +2,13 @@
 #import <Security/Security.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_media.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -32,6 +35,18 @@ static const NSInteger kInterfaceRescanTicks = 20;
 // USB/Thunderbolt adapters take a moment to come back after wake; reconnecting
 // right away tends to find no interface (or the wrong one).
 static const NSTimeInterval kWakeReconnectDelay = 4.0;
+// minieap's online marker only means the server said EAP-Success. A server still
+// holding a stale session, or a DHCP lease that never refreshed, can say that
+// with the port effectively dead, so "已连接" waits for a real reachability probe.
+// After this long authenticated-but-unreachable, the app repairs once on its own.
+static const NSTimeInterval kOnlineVerifyGrace = 30.0;
+// Probes while verified only need to notice the network silently dying.
+static const NSInteger kVerifiedProbeTicks = 10;
+static const NSInteger kProbeFailuresBeforeOffline = 3;
+// At login a USB/Thunderbolt adapter may not be enumerated or have link yet;
+// starting on whatever interface happens to exist then authenticates nothing.
+static const NSInteger kAutoStartLinkWaitAttempts = 10;
+static const NSTimeInterval kAutoStartLinkWaitInterval = 2.0;
 
 @interface NetworkInterfaceInfo : NSObject
 @property(nonatomic, copy) NSString *bsdName;
@@ -56,6 +71,8 @@ static const NSTimeInterval kWakeReconnectDelay = 4.0;
 + (NSString *)getIPv4AddressForInterface:(NSString *)ifname;
 + (NSArray<NetworkInterfaceInfo *> *)allEthernetInterfaces;
 + (NetworkInterfaceInfo *)bestEthernetInterfaceWithPreferred:(NSString *)preferred;
++ (BOOL)isLinkLocalIPv4:(NSString *)ip;
++ (BOOL)probeReachabilityOnInterface:(NSString *)ifname;
 @end
 
 @implementation NetworkHelper
@@ -157,6 +174,105 @@ static const NSTimeInterval kWakeReconnectDelay = 4.0;
     return nil;
 }
 
++ (BOOL)isLinkLocalIPv4:(NSString *)ip {
+    return [ip hasPrefix:@"169.254."];
+}
+
+// The DHCP router of the service bound to this interface, if any.
++ (NSString *)routerForInterface:(NSString *)ifname {
+    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("RGForMacProbe"), NULL, NULL);
+    if (!store) return nil;
+    NSDictionary *values = (__bridge_transfer NSDictionary *)SCDynamicStoreCopyMultiple(
+        store, NULL, (__bridge CFArrayRef)@[@"State:/Network/Service/[^/]+/IPv4"]);
+    CFRelease(store);
+    for (NSDictionary *ipv4 in values.allValues) {
+        if (![ipv4 isKindOfClass:[NSDictionary class]]) continue;
+        if (![ipv4[@"InterfaceName"] isEqual:ifname]) continue;
+        NSString *router = ipv4[@"Router"];
+        if ([router isKindOfClass:[NSString class]] && router.length > 0) return router;
+    }
+    return nil;
+}
+
+// Whether traffic actually leaves through this interface, judged by TCP
+// connects to a few well-known hosts (and the DHCP router). The sockets are
+// pinned to the interface with IP_BOUND_IF, so a proxy app's system proxy
+// setting or TUN/"enhanced mode" default route neither helps nor hurts the
+// verdict: it reflects the campus port itself, not whatever the proxy does.
+// A refused connection counts as reachable - something answered on the wire.
++ (BOOL)probeReachabilityOnInterface:(NSString *)ifname {
+    unsigned int ifindex = if_nametoindex(ifname.UTF8String);
+    if (ifindex == 0) return NO;
+
+    NSMutableArray<NSArray *> *targets = [NSMutableArray arrayWithArray:@[
+        @[@"223.5.5.5", @443],
+        @[@"114.114.114.114", @53],
+        @[@"119.29.29.29", @53],
+        @[@"180.76.76.76", @53],
+    ]];
+    NSString *router = [self routerForInterface:ifname];
+    if (router) [targets addObject:@[router, @53]];
+
+    struct pollfd fds[8];
+    nfds_t count = 0;
+    BOOL reachable = NO;
+    for (NSArray *target in targets) {
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_len = sizeof(addr);
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons([target[1] unsignedShortValue]);
+        if (inet_pton(AF_INET, [target[0] UTF8String], &addr.sin_addr) != 1) continue;
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+        if (setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &ifindex, sizeof(ifindex)) != 0
+            || fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) != 0) {
+            close(fd);
+            continue;
+        }
+        int nosig = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 || errno == ECONNREFUSED) {
+            reachable = YES;
+            close(fd);
+            break;
+        }
+        if (errno != EINPROGRESS) {
+            close(fd);
+            continue;
+        }
+        fds[count].fd = fd;
+        fds[count].events = POLLOUT;
+        fds[count].revents = 0;
+        count++;
+    }
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+    nfds_t pending = count;
+    while (!reachable && pending > 0) {
+        int waitMs = (int)([deadline timeIntervalSinceNow] * 1000);
+        if (waitMs <= 0) break;
+        int ready = poll(fds, count, waitMs);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) break;
+        for (nfds_t i = 0; i < count; i++) {
+            if (fds[i].fd < 0 || fds[i].revents == 0) continue;
+            int err = 0;
+            socklen_t len = sizeof(err);
+            getsockopt(fds[i].fd, SOL_SOCKET, SO_ERROR, &err, &len);
+            if (err == 0 || err == ECONNREFUSED) reachable = YES;
+            close(fds[i].fd);
+            fds[i].fd = -1;
+            pending--;
+        }
+    }
+    for (nfds_t i = 0; i < count; i++) {
+        if (fds[i].fd >= 0) close(fds[i].fd);
+    }
+    return reachable;
+}
+
 @end
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -182,6 +298,14 @@ static const NSTimeInterval kWakeReconnectDelay = 4.0;
 @property(nonatomic, assign) BOOL reconnectOnWake;
 @property(nonatomic, assign) BOOL poweringOff;
 @property(nonatomic, assign) SCDynamicStoreRef dynamicStore;
+// Real-connectivity tracking on top of minieap's "EAP-Success" marker.
+@property(nonatomic, strong) NSDate *onlineSince;
+@property(nonatomic, assign) BOOL networkVerified;
+@property(nonatomic, assign) BOOL probeInFlight;
+@property(nonatomic, assign) NSInteger probeFailures;
+@property(nonatomic, assign) NSInteger ticksSinceProbe;
+@property(nonatomic, assign) NSUInteger probeGeneration;
+@property(nonatomic, assign) BOOL autoRepairUsed;
 - (void)stopAuthThenQuit:(BOOL)quitAfterStop force:(BOOL)force;
 - (void)systemNetworkChanged;
 @end
@@ -511,17 +635,109 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         return;
     }
 
+    [self trackConnectivityOnline:(isOnlineNow && !linkDown) interface:iface ip:ip];
+
     if (isRunningNow && linkDown) {
         self.statusItemText.title = @"状态：网线未连接";
         self.statusItem.button.title = @"RG…";
+    } else if (isOnlineNow && self.networkVerified) {
+        self.statusItemText.title = [NSString stringWithFormat:@"状态：已连接 (PID: %d)", (int)pid];
+        self.statusItem.button.title = @"RG✓";
+    } else if (isOnlineNow) {
+        BOOL overdue = -[self.onlineSince timeIntervalSinceNow] >= kOnlineVerifyGrace;
+        self.statusItemText.title = overdue ? @"状态：已认证但无法上网（可试“修复网络并重连”）"
+                                            : @"状态：已认证，正在等待网络就绪…";
+        self.statusItem.button.title = overdue ? @"RG!" : @"RG…";
     } else {
-        self.statusItemText.title = isOnlineNow ? [NSString stringWithFormat:@"状态：已连接 (PID: %d)", (int)pid]
-                                   : isRunningNow ? @"状态：正在认证中…"
-                                   : @"状态：未连接";
-        self.statusItem.button.title = isOnlineNow ? @"RG✓" : (isRunningNow ? @"RG…" : @"RG");
+        self.statusItemText.title = isRunningNow ? @"状态：正在认证中…" : @"状态：未连接";
+        self.statusItem.button.title = isRunningNow ? @"RG…" : @"RG";
     }
     self.startItem.enabled = !isRunningNow;
     self.stopItem.enabled = isRunningNow;
+}
+
+- (void)resetConnectivityTracking {
+    self.onlineSince = nil;
+    self.networkVerified = NO;
+    self.probeFailures = 0;
+    self.ticksSinceProbe = 0;
+    self.probeGeneration++; // Drop any probe still in flight for the old session
+    self.probeInFlight = NO;
+}
+
+- (void)trackConnectivityOnline:(BOOL)online interface:(NSString *)iface ip:(NSString *)ip {
+    if (!online) {
+        if (self.onlineSince) [self resetConnectivityTracking];
+        return;
+    }
+    if (!self.onlineSince) {
+        self.onlineSince = [NSDate date];
+        self.ticksSinceProbe = kVerifiedProbeTicks; // Probe right away
+    }
+
+    // No usable address yet: DHCP is still running (or stuck on a self-assigned
+    // 169.254 address from before the port opened). No point probing.
+    BOOL hasAddress = ip.length > 0 && ![NetworkHelper isLinkLocalIPv4:ip];
+    if (!hasAddress) {
+        [self markNetworkUnverified];
+    } else if (!self.probeInFlight
+               && (!self.networkVerified || ++self.ticksSinceProbe >= kVerifiedProbeTicks)) {
+        self.ticksSinceProbe = 0;
+        self.probeInFlight = YES;
+        NSUInteger generation = self.probeGeneration;
+        NSString *probeIface = [iface copy];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            BOOL reachable = [NetworkHelper probeReachabilityOnInterface:probeIface];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (generation != self.probeGeneration) return;
+                self.probeInFlight = NO;
+                [self handleProbeResult:reachable];
+            });
+        });
+    }
+    [self autoRepairIfStuck];
+}
+
+- (void)handleProbeResult:(BOOL)reachable {
+    if (reachable) {
+        BOOL changed = !self.networkVerified;
+        self.networkVerified = YES;
+        self.probeFailures = 0;
+        self.autoRepairUsed = NO; // Working again; a later breakage may repair again
+        if (changed) [self updateStatus];
+        return;
+    }
+    if (self.networkVerified && ++self.probeFailures < kProbeFailuresBeforeOffline) {
+        return; // One lost probe while verified is not an outage
+    }
+    if (self.networkVerified) {
+        [self markNetworkUnverified];
+        [self updateStatus];
+    }
+}
+
+// A session that was working and then lost its address or reachability gets a
+// fresh grace period from now, not from when it first authenticated hours ago -
+// otherwise a routine DHCP renewal would trigger an instant auto-repair.
+- (void)markNetworkUnverified {
+    if (!self.networkVerified) return;
+    self.networkVerified = NO;
+    self.probeFailures = 0;
+    self.onlineSince = [NSDate date];
+}
+
+// The "connected but nothing works until I stop and start again" case: do that
+// stop/start for the user, once per breakage. The repair path sends a Logoff,
+// renews DHCP and re-authenticates, which is exactly the manual workaround.
+- (void)autoRepairIfStuck {
+    if (self.networkVerified || !self.onlineSince || self.autoRepairUsed) return;
+    if (-[self.onlineSince timeIntervalSinceNow] < kOnlineVerifyGrace) return;
+    if (!self.userWantsConnected || self.starting || self.stopping || self.asleep) return;
+    self.autoRepairUsed = YES;
+    NSLog(@"已认证 %.0f 秒仍无法访问网络，自动修复网络并重连", kOnlineVerifyGrace);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self startAuthWithNetworkRepair:YES];
+    });
 }
 
 // minieap retries on its own now, so it only exits by itself once the server
@@ -631,19 +847,41 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
 }
 
 - (void)startAuth {
+    self.autoRepairUsed = NO;
     [self startAuthWithNetworkRepair:NO];
 }
 
 - (void)autoStartIfNeeded {
-    if (![self miniEAPRunning]) {
-        [self startAuthWithNetworkRepair:NO];
-    } else {
+    if ([self miniEAPRunning]) {
         self.userWantsConnected = YES;
         [self updateStatus];
+        return;
     }
+    self.userWantsConnected = YES;
+    [self autoStartWhenLinkReady:kAutoStartLinkWaitAttempts];
+}
+
+// Right after login the adapter may not exist yet, or has no link: starting
+// then would pick the wrong interface or pop "未检测到任何以太网接口". Wait a
+// little for a cabled interface; start anyway once the wait runs out.
+- (void)autoStartWhenLinkReady:(NSInteger)attemptsLeft {
+    if (!self.userWantsConnected || self.starting || self.stopping || [self miniEAPRunning]) {
+        return;
+    }
+    [self refreshInterfaceList];
+    NSString *iface = [self effectiveInterfaceName];
+    BOOL linkUp = iface.length > 0 && [NetworkHelper isInterfaceActive:iface];
+    if (!linkUp && attemptsLeft > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoStartLinkWaitInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self autoStartWhenLinkReady:attemptsLeft - 1];
+        });
+        return;
+    }
+    [self startAuthWithNetworkRepair:NO];
 }
 
 - (void)repairAndReconnect {
+    self.autoRepairUsed = NO;
     [self startAuthWithNetworkRepair:YES];
 }
 
@@ -811,6 +1049,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
 - (void)markStarting {
     self.starting = YES;
     self.lastStartError = nil;
+    [self resetConnectivityTracking];
     [self updateStatus];
 }
 
@@ -944,7 +1183,15 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         quotedIface
     ] : @"";
     NSString *passwordFile = [self shellQuote:[self passwordFile]];
-    NSString *dhcpScript = [NSString stringWithFormat:@"/usr/sbin/ipconfig set %@ DHCP", quotedIface];
+    // Run by minieap (root) right at EAP-Success. The switch can take a moment
+    // to actually open the port, and a DISCOVER sent into that gap makes macOS
+    // back off for a long time (or settle on 169.254.x.x) - "connected" with no
+    // address. So renew a beat later in the background, and once more if no
+    // real lease showed up. minieap caps this string at 259 bytes.
+    NSString *dhcpScript = [NSString stringWithFormat:
+        @"(/bin/sleep 1;/usr/sbin/ipconfig set %@ DHCP;/bin/sleep 8;"
+         "case $(/usr/sbin/ipconfig getifaddr %@) in ''|169.254.*)/usr/sbin/ipconfig set %@ DHCP;;esac)>/dev/null 2>&1 &",
+        quotedIface, quotedIface, quotedIface];
 
     // 启动前先无条件清理旧进程，防止冲突
     NSString *command = [NSString stringWithFormat:
@@ -956,7 +1203,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         "if [ -z \"$MINIEAP_PASSWORD\" ]; then echo '无法读取临时密码文件' >&2; exit 1; fi\n"
         "export MINIEAP_PASSWORD\n"
         "export MINIEAP_REQUIRE_EXISTING_FILES=1\n"
-        "%@ --if-impl libpcap --module rjv3 -u %@ --password-env MINIEAP_PASSWORD -n %@ -a 1 -d 2 --heartbeat 30 --max-fail %ld --max-retries 0 --wait-after-fail %ld --version-str %@ --rj-option %@ --fake-dns1 %@ --fake-dns2 %@ --dhcp-script %@ --daemonize 3 --log-file %@ --pid-file %@ --conf-file /dev/null >/dev/null 2>&1 &\n",
+        "%@ --if-impl libpcap --module rjv3 -u %@ --password-env MINIEAP_PASSWORD -n %@ -a 1 -d 2 --heartbeat 30 --logoff-first --max-fail %ld --max-retries 0 --wait-after-fail %ld --version-str %@ --rj-option %@ --fake-dns1 %@ --fake-dns2 %@ --dhcp-script %@ --daemonize 3 --log-file %@ --pid-file %@ --conf-file /dev/null >/dev/null 2>&1 &\n",
         [self stopCommand],
         networkRepairPrefix,
         passwordFile, passwordFile, passwordFile,

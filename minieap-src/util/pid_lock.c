@@ -37,6 +37,12 @@ RESULT pid_lock_init(const char* pidfile) {
 #ifdef O_NOFOLLOW
     open_flags |= O_NOFOLLOW;
 #endif
+#ifdef O_CLOEXEC
+    // The flock lives on this open file; a --dhcp-script child still sleeping
+    // in the background would otherwise keep it held after we exit, and the
+    // next instance would refuse to start as "already running".
+    open_flags |= O_CLOEXEC;
+#endif
     pid_lock_fd = open(pidfile, open_flags, 0644);
     if (pid_lock_fd < 0) {
         PR_ERRNO("无法打开 PID 文件");
