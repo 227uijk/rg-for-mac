@@ -248,8 +248,12 @@ static RESULT rjv3_process_success(struct _packet_plugin* this, ETH_EAP_FRAME* f
             rjv3_reset_state(this);
             PR_INFO("二次认证成功");
         }
-    } else if (PRIV->dhcp_type == DHCP_AFTER_AUTH) {
-        /* Run script after one-pass authentication finishes */
+    } else if (PRIV->dhcp_type == DHCP_AFTER_AUTH && PRIV->succ_count == 1) {
+        /* Run script after one-pass authentication finishes. Only for the
+         * first success since start or the last failure: a server-initiated
+         * re-auth of a session that is already up must not tear down a
+         * working lease (the script typically forces a DHCP renewal).
+         */
         system(PRIV->dhcp_script);
     }
 
@@ -258,7 +262,7 @@ static RESULT rjv3_process_success(struct _packet_plugin* this, ETH_EAP_FRAME* f
     }
 
     PR_INFO("正定时发送 Keep-Alive 报文以保持在线……");
-    schedule_alarm(1, rjv3_send_keepalive_timed, this);
+    rjv3_keepalive_start(this);
     return SUCCESS;
 }
 

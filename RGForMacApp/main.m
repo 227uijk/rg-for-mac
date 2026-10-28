@@ -306,6 +306,9 @@ static const NSTimeInterval kAutoStartLinkWaitInterval = 2.0;
 @property(nonatomic, assign) NSInteger ticksSinceProbe;
 @property(nonatomic, assign) NSUInteger probeGeneration;
 @property(nonatomic, assign) BOOL autoRepairUsed;
+// The admin script is running, which mostly means its password prompt is up.
+@property(nonatomic, assign) BOOL awaitingAuthorization;
+@property(nonatomic, copy) NSString *lastLoggedStatus;
 - (void)stopAuthThenQuit:(BOOL)quitAfterStop force:(BOOL)force;
 - (void)systemNetworkChanged;
 @end
@@ -340,6 +343,12 @@ static const NSTimeInterval kAutoStartLinkWaitInterval = 2.0;
 
 - (NSString *)logFile {
     return [[self logDir] stringByAppendingPathComponent:@"minieap.log"];
+}
+
+// The app's own view of things (status changes, auto-repair), next to
+// minieap's log, so "it showed offline for a moment" can be traced afterwards.
+- (NSString *)appLogFile {
+    return [[self logDir] stringByAppendingPathComponent:@"app.log"];
 }
 
 - (NSString *)pidFile {
@@ -588,6 +597,12 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         [self ensureCurrentUserPath:[self logFile] mode:S_IFREG];
     }
 
+    if ([[fm attributesOfItemAtPath:[self appLogFile] error:nil] fileSize] > 1024 * 1024) {
+        NSString *old = [[self logDir] stringByAppendingPathComponent:@"app.old.log"];
+        [fm removeItemAtPath:old error:nil];
+        [fm moveItemAtPath:[self appLogFile] toPath:old error:nil];
+    }
+
     NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-(14 * 24 * 60 * 60)];
     NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:[self logDir] error:nil];
     for (NSString *file in files) {
@@ -626,14 +641,18 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     self.ifaceItemText.title = [NSString stringWithFormat:@"网卡：%@%@", iface ?: @"无", ip ? [NSString stringWithFormat:@" (%@)", ip] : @""];
 
     if (self.starting) {
-        self.statusItemText.title = @"状态：正在启动认证…";
+        // At login the password prompt is easy to miss behind other windows;
+        // say what we are actually waiting for instead of a vague "starting".
+        [self setStatusText:self.awaitingAuthorization ? @"状态：等待管理员授权（请在系统密码框里确认）"
+                                                       : @"状态：正在启动认证…"];
         self.statusItem.button.title = @"RG…";
         self.startItem.enabled = NO;
         self.stopItem.enabled = YES;
         return;
     }
     if (self.stopping) {
-        self.statusItemText.title = @"状态：正在停止认证…";
+        [self setStatusText:self.awaitingAuthorization ? @"状态：等待管理员授权以停止认证"
+                                                       : @"状态：正在停止认证…"];
         self.statusItem.button.title = @"RG…";
         self.startItem.enabled = NO;
         self.stopItem.enabled = NO;
@@ -643,22 +662,47 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     [self trackConnectivityOnline:(isOnlineNow && !linkDown) interface:iface ip:ip];
 
     if (isRunningNow && linkDown) {
-        self.statusItemText.title = @"状态：网线未连接";
+        [self setStatusText:@"状态：网线未连接"];
         self.statusItem.button.title = @"RG…";
     } else if (isOnlineNow && self.networkVerified) {
-        self.statusItemText.title = [NSString stringWithFormat:@"状态：已连接 (PID: %d)", (int)pid];
+        [self setStatusText:[NSString stringWithFormat:@"状态：已连接 (PID: %d)", (int)pid]];
         self.statusItem.button.title = @"RG✓";
     } else if (isOnlineNow) {
         BOOL overdue = -[self.onlineSince timeIntervalSinceNow] >= kOnlineVerifyGrace;
-        self.statusItemText.title = overdue ? @"状态：已认证但无法上网（可试“修复网络并重连”）"
-                                            : @"状态：已认证，正在等待网络就绪…";
+        [self setStatusText:overdue ? @"状态：已认证但无法上网（可试“修复网络并重连”）"
+                                    : @"状态：已认证，正在等待网络就绪…"];
         self.statusItem.button.title = overdue ? @"RG!" : @"RG…";
     } else {
-        self.statusItemText.title = isRunningNow ? @"状态：正在认证中…" : @"状态：未连接";
+        [self setStatusText:isRunningNow ? @"状态：正在认证中…" : @"状态：未连接"];
         self.statusItem.button.title = isRunningNow ? @"RG…" : @"RG";
     }
     self.startItem.enabled = !isRunningNow;
     self.stopItem.enabled = isRunningNow;
+}
+
+- (void)setStatusText:(NSString *)text {
+    self.statusItemText.title = text;
+    if (![text isEqualToString:self.lastLoggedStatus]) {
+        self.lastLoggedStatus = text;
+        [self appendAppLog:text];
+    }
+}
+
+- (void)appendAppLog:(NSString *)line {
+    if (![self isCurrentUserPath:[self logDir] mode:S_IFDIR]) return;
+    NSString *path = [self appLogFile];
+    int open_flags = O_WRONLY | O_CREAT | O_APPEND;
+#ifdef O_NOFOLLOW
+    open_flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path.fileSystemRepresentation, open_flags, 0644);
+    if (fd < 0) return;
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    NSString *entry = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], line];
+    NSData *data = [entry dataUsingEncoding:NSUTF8StringEncoding];
+    (void)write(fd, data.bytes, data.length);
+    close(fd);
 }
 
 - (void)resetConnectivityTracking {
@@ -712,6 +756,9 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         if (changed) [self updateStatus];
         return;
     }
+    if (self.networkVerified) {
+        [self appendAppLog:[NSString stringWithFormat:@"外网探测失败（连续第 %ld 次）", (long)self.probeFailures + 1]];
+    }
     if (self.networkVerified && ++self.probeFailures < kProbeFailuresBeforeOffline) {
         return; // One lost probe while verified is not an outage
     }
@@ -739,7 +786,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     if (-[self.onlineSince timeIntervalSinceNow] < kOnlineVerifyGrace) return;
     if (!self.userWantsConnected || self.starting || self.stopping || self.asleep) return;
     self.autoRepairUsed = YES;
-    NSLog(@"已认证 %.0f 秒仍无法访问网络，自动修复网络并重连", kOnlineVerifyGrace);
+    [self appendAppLog:[NSString stringWithFormat:@"已认证 %.0f 秒仍无法访问网络，自动修复网络并重连", kOnlineVerifyGrace]];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self startAuthWithNetworkRepair:YES];
     });
@@ -939,6 +986,10 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSDictionary *result = [self runAdminShell:command];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.awaitingAuthorization = NO;
+            [self updateStatus];
+        });
         // The root script deletes it after reading; this covers a cancelled prompt.
         unlink([self passwordFile].fileSystemRepresentation);
         BOOL running = [self waitForMiniEAPRunningWithTimeout:(repairNetwork ? 8.0 : 4.0)];
@@ -1010,6 +1061,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
 
     self.userWantsConnected = NO;
     self.stopping = YES;
+    self.awaitingAuthorization = YES;
     [self updateStatus];
     NSString *command = [self stopCommand];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1017,6 +1069,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         BOOL stopped = [self waitForMiniEAPStoppedWithTimeout:3.0];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.stopping = NO;
+            self.awaitingAuthorization = NO;
             if (!stopped || ![result[@"ok"] boolValue]) {
                 self.terminatingAfterStop = NO;
                 // minieap is still up, so keep treating it as wanted: otherwise
@@ -1064,6 +1117,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
 
 - (void)markStarting {
     self.starting = YES;
+    self.awaitingAuthorization = YES;
     self.lastStartError = nil;
     [self resetConnectivityTracking];
     [self updateStatus];

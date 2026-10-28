@@ -108,6 +108,19 @@ RESULT rjv3_send_new_keepalive_frame(struct _packet_plugin* this) {
     return send_echo_frame(this, _template, sizeof(_template));
 }
 
+void rjv3_send_keepalive_timed(void* vthis);
+
+/*
+ * (Re)start the heartbeat chain. Every EAP-Success used to schedule a fresh
+ * chain without stopping the running one, so each server-initiated re-auth
+ * added another heartbeat loop that nothing could cancel. They all bumped the
+ * shared echo number, the server saw it skip, and kicked the session offline.
+ */
+void rjv3_keepalive_start(void* vthis) {
+    unschedule_alarm(g_keepalive_alarm_id);
+    g_keepalive_alarm_id = schedule_alarm(1, rjv3_send_keepalive_timed, vthis);
+}
+
 void rjv3_send_keepalive_timed(void* vthis) {
     PACKET_PLUGIN* this = (PACKET_PLUGIN*)vthis;
     if (IS_FAIL(rjv3_send_new_keepalive_frame(this))) {
