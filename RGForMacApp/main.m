@@ -321,7 +321,10 @@ static const NSTimeInterval kAutoStartLinkWaitInterval = 2.0;
     [self observeSystemChanges];
     [self updateStatus];
 
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(updateStatus) userInfo:nil repeats:YES];
+    // Common modes, so the status keeps updating while the menu is open
+    // (menu tracking runs the loop outside the default mode).
+    self.timer = [NSTimer timerWithTimeInterval:3.0 target:self selector:@selector(updateStatus) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self autoStartIfNeeded];
     });
@@ -576,7 +579,9 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     NSFileManager *fm = [NSFileManager defaultManager];
     NSDictionary *attrs = [fm attributesOfItemAtPath:[self logFile] error:nil];
     unsigned long long size = [attrs fileSize];
-    if (size > 2 * 1024 * 1024) {
+    // A running minieap keeps appending to the file it opened, so renaming it
+    // now would leave minieap.log empty and the live log under the old name.
+    if (size > 2 * 1024 * 1024 && ![self miniEAPRunning]) {
         NSString *name = [NSString stringWithFormat:@"minieap-%@.log", [self timestamp]];
         NSString *rotated = [[self logDir] stringByAppendingPathComponent:name];
         [fm moveItemAtPath:[self logFile] toPath:rotated error:nil];
@@ -949,6 +954,10 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
                 self.lastStartError = nil;
             } else if (stopAfterStart) {
                 self.lastStartError = nil;
+            } else if ([result[@"cancelled"] boolValue]) {
+                // The user said no to the admin prompt; that is an answer, not an error.
+                self.lastStartError = nil;
+                self.userWantsConnected = NO;
             } else if ([result[@"ok"] boolValue]) {
                 // The script only backgrounds minieap, so "ok" says nothing about
                 // whether it survived its own startup (bad interface, pcap error).
@@ -1010,7 +1019,14 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
             self.stopping = NO;
             if (!stopped || ![result[@"ok"] boolValue]) {
                 self.terminatingAfterStop = NO;
-                [self showMessage:[NSString stringWithFormat:@"停止失败：%@", result[@"message"] ?: @"未知错误"]];
+                // minieap is still up, so keep treating it as wanted: otherwise
+                // auto-repair and wake reconnect stay off for a live session.
+                if ([self miniEAPRunning]) {
+                    self.userWantsConnected = YES;
+                }
+                if (![result[@"cancelled"] boolValue]) {
+                    [self showMessage:[NSString stringWithFormat:@"停止失败：%@", result[@"message"] ?: @"未知错误"]];
+                }
                 [self updateStatus];
                 return;
             }
@@ -1265,7 +1281,11 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     NSString *stderrText = [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding] ?: @"";
     NSString *message = stderrText.length > 0 ? stderrText : stdoutText;
     if (task.terminationStatus != 0) {
-        return @{@"ok": @NO, @"message": message.length > 0 ? message : [NSString stringWithFormat:@"管理员脚本退出码：%d", task.terminationStatus]};
+        // -128 is AppleScript's userCanceledErr: the admin prompt was dismissed.
+        // The text around it is localized, the number is not.
+        BOOL cancelled = [stderrText containsString:@"(-128)"];
+        return @{@"ok": @NO, @"cancelled": @(cancelled),
+                 @"message": message.length > 0 ? message : [NSString stringWithFormat:@"管理员脚本退出码：%d", task.terminationStatus]};
     }
     return @{@"ok": @YES, @"message": stdoutText};
 }

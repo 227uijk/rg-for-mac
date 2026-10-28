@@ -2,7 +2,9 @@
 set -u
 
 LAB_DIR="${0:A:h}"
-MINIEAP="$LAB_DIR/minieap"
+# build.sh 编出来的在 minieap-src/ 里；没编过的话也可以直接用 App 里带的那份
+MINIEAP="$LAB_DIR/minieap-src/minieap"
+[ -x "$MINIEAP" ] || MINIEAP="$LAB_DIR/RG For Mac.app/Contents/Resources/minieap"
 LOG_DIR="$LAB_DIR/logs"
 CAP_DIR="$LAB_DIR/captures"
 IFACE="${1:-en6}"

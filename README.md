@@ -74,6 +74,14 @@ GUI 进程本身不需要 root；真正收发以太网帧、需要裸抓包权�
 - `VersionString`：伪装的官方客户端版本号，不同学校服务器可能要求不同版本才放行。
 - 认证失败时看日志（菜单栏"打开日志文件夹"），MiniEAP 会打印服务器返回的具体拒绝原因，照着调整参数。
 
+仓库根目录有三个双击就能跑的调试脚本，对参数时用得上（抓包和日志会落在 `captures/`、`logs/`，里面有账号信息，已经被 `.gitignore` 排除）：
+
+- `01-capture-official.command`：打开官方锐捷客户端认证一次，同时用 `tcpdump` 抓下 EAPOL 包，作为"成功样本"。
+- `02-test-minieap.command`：用编好的 MiniEAP 认证一次并抓包，和上面的成功样本逐包对比。账号用环境变量 `CAMPUS_USERNAME` 传入。
+- `03-stop-auth.command`：清掉残留的 minieap / mentohust / 官方客户端进程。
+
+三个脚本默认网卡是 `en6`，不对的话把网卡名作为第一个参数传进去（不存在时会退回默认路由所在的网卡）。
+
 ## 已知限制
 
 - 每次连接/断开都要走 `osascript ... with administrator privileges` 弹管理员授权框，做不到完全静默（掉线重连在认证进程内部完成，不会再弹）。密码通过 `~/Library/Application Support/RGForMac/` 下一个仅本人可读（0600）的临时文件交给 root 脚本，读完立即删除，不会出现在任何进程的命令行参数里。
