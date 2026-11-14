@@ -14,6 +14,7 @@
 
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
 
 typedef struct _state_mach_priv {
     int state_last_count; // Number of timeouts occured in this state
@@ -397,9 +398,12 @@ static RESULT trans_to_preparing(ETH_EAP_FRAME* frame) {
         // with no network until a manual stop/start sends the Logoff for us.
         PR_INFO("正在发送 EAPOL-Logoff 清除服务器上可能残留的旧会话");
         state_mach_send_eapol_simple(EAPOL_LOGOFF);
-        // Keep the grace period even when a SIGALRM timer interrupts sleep().
+        // Keep the grace period even when a SIGALRM timer interrupts sleep(),
+        // but stop retrying once 2s have elapsed: sleep() rounds a fractional
+        // remainder up, so a 1s timer could otherwise starve this forever.
+        time_t logoff_wait_end = time(NULL) + 2;
         unsigned int logoff_wait_left = 2;
-        while (logoff_wait_left > 0) {
+        while (logoff_wait_left > 0 && time(NULL) < logoff_wait_end) {
             logoff_wait_left = sleep(logoff_wait_left);
         }
     }
