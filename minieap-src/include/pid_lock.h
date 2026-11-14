@@ -16,4 +16,13 @@ RESULT pid_lock_destroy();
 RESULT pid_lock_mark_online();
 void pid_lock_clear_online();
 
+/*
+ * Requests from the (unprivileged) owner of the pidfile's directory, passed as
+ * empty "<pidfile><suffix>" files, so the menu bar app can stop or re-auth us
+ * without another administrator prompt. Taking a request removes the file.
+ */
+#define PID_LOCK_REQUEST_STOP ".stop"
+#define PID_LOCK_REQUEST_REAUTH ".reauth"
+int pid_lock_take_request(const char* suffix);
+
 #endif

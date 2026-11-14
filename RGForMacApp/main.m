@@ -23,6 +23,15 @@ static NSString * const VersionString = @"RG-SU For Mac V1.35";
 static NSString * const DNS1 = @"114.114.114.114";
 static NSString * const DNS2 = @"114.114.115.115";
 static NSString * const PrefSelectedInterface = @"selected-interface";
+// The interface the running minieap was launched on, so an in-place re-auth is
+// only used while it is still the one we would pick.
+static NSString * const PrefRunningInterface = @"running-interface";
+// Request files minieap polls for once a second (see pid_lock.h); writing one
+// needs no administrator prompt because the directory belongs to this user.
+static NSString * const StopRequestSuffix = @".stop";
+static NSString * const ReauthRequestSuffix = @".reauth";
+static const NSTimeInterval kStopRequestTimeout = 4.0;
+static const NSTimeInterval kReauthRequestTimeout = 3.0;
 // Retrying now happens inside minieap itself: it already holds root, so a retry
 // no longer needs another administrator prompt the way relaunching it would.
 // Timeouts (no server reply, e.g. cable out) retry forever; outright rejections
@@ -307,6 +316,7 @@ static const NSTimeInterval kAutoStartLinkWaitInterval = 2.0;
 @property(nonatomic, assign) NSUInteger probeGeneration;
 @property(nonatomic, assign) BOOL autoRepairUsed;
 - (void)stopAuthThenQuit:(BOOL)quitAfterStop force:(BOOL)force;
+- (void)startAuthWithNetworkRepair:(BOOL)repairNetwork allowInPlace:(BOOL)allowInPlace;
 - (void)systemNetworkChanged;
 @end
 
@@ -322,6 +332,9 @@ static const NSTimeInterval kAutoStartLinkWaitInterval = 2.0;
     [self updateStatus];
 
     self.timer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(updateStatus) userInfo:nil repeats:YES];
+    // Default mode alone pauses the timer while the menu is open, so the status
+    // line froze at whatever it said when the menu was clicked.
+    [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self autoStartIfNeeded];
     });
@@ -349,6 +362,75 @@ static const NSTimeInterval kAutoStartLinkWaitInterval = 2.0;
 
 - (NSString *)onlineMarkerFile {
     return [[self pidFile] stringByAppendingString:@".online"];
+}
+
+- (NSString *)requestFileWithSuffix:(NSString *)suffix {
+    return [[self pidFile] stringByAppendingString:suffix];
+}
+
+- (BOOL)writeRequestFileWithSuffix:(NSString *)suffix {
+    int open_flags = O_WRONLY | O_CREAT | O_TRUNC;
+#ifdef O_NOFOLLOW
+    open_flags |= O_NOFOLLOW;
+#endif
+    int fd = open([self requestFileWithSuffix:suffix].fileSystemRepresentation, open_flags, 0644);
+    if (fd < 0) {
+        return NO;
+    }
+    close(fd);
+    return YES;
+}
+
+- (void)removeRequestFileWithSuffix:(NSString *)suffix {
+    unlink([self requestFileWithSuffix:suffix].fileSystemRepresentation);
+}
+
+// Blocking; call off the main thread. minieap deletes the file once it acts on it.
+- (BOOL)waitForRequestFileTaken:(NSString *)suffix timeout:(NSTimeInterval)timeout {
+    NSString *path = [self requestFileWithSuffix:suffix];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    struct stat info;
+    while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+        if (lstat(path.fileSystemRepresentation, &info) != 0) {
+            return YES;
+        }
+        [NSThread sleepForTimeInterval:0.1];
+    }
+    return lstat(path.fileSystemRepresentation, &info) != 0;
+}
+
+// The last error/warning minieap logged, e.g. the server's failure message, so
+// an alert can say why instead of only pointing at the log folder.
+- (NSString *)lastLoggedProblem {
+    NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:[self logFile]];
+    if (!handle) {
+        return nil;
+    }
+    unsigned long long size = [handle seekToEndOfFile];
+    unsigned long long window = 16 * 1024;
+    [handle seekToFileOffset:(size > window ? size - window : 0)];
+    NSData *data = [handle readDataToEndOfFile];
+    [handle closeFile];
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!text) {
+        // The window may have cut a multi-byte character in half.
+        text = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+        if (!text) return nil;
+    }
+    for (NSString *line in [[text componentsSeparatedByString:@"\n"] reverseObjectEnumerator]) {
+        NSRange tag = [line rangeOfString:@"][E]"];
+        if (tag.location == NSNotFound) tag = [line rangeOfString:@"][W]"];
+        if (tag.location == NSNotFound) continue;
+        NSString *message = [[line substringFromIndex:NSMaxRange(tag)]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (message.length > 0) return message;
+    }
+    return nil;
+}
+
+- (NSString *)messageWithLoggedProblem:(NSString *)message {
+    NSString *problem = [self lastLoggedProblem];
+    return problem.length ? [NSString stringWithFormat:@"%@\n\n日志里最后的错误：%@", message, problem] : message;
 }
 
 - (NSString *)confFile {
@@ -765,7 +847,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     }
     self.userWantsConnected = NO;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self showMessage:@"认证进程多次重试后已退出，请检查网线和账号密码（菜单里“打开日志文件夹”可以看到服务器返回的原因），然后手动点“启动认证”。"];
+        [self showMessage:[self messageWithLoggedProblem:@"认证进程多次重试后已退出，请检查网线和账号密码，然后手动点“启动认证”。"]];
     });
 }
 
@@ -886,12 +968,58 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
 }
 
 - (void)startAuthWithNetworkRepair:(BOOL)repairNetwork {
+    [self startAuthWithNetworkRepair:repairNetwork allowInPlace:YES];
+}
+
+// Repairing used to always mean kill + relaunch through another administrator
+// prompt - including the automatic repair, which popped one out of nowhere.
+// While minieap is up on the right interface, ask it to log off and
+// re-authenticate instead; its DHCP script then renews the lease as usual.
+- (BOOL)requestInPlaceReauth {
+    NSString *runningIface = [[NSUserDefaults standardUserDefaults] stringForKey:PrefRunningInterface];
+    self.interfaceCacheValid = NO;
+    if (!runningIface.length || ![runningIface isEqualToString:[self effectiveInterfaceName]]
+        || ![self miniEAPRunning] || ![self writeRequestFileWithSuffix:ReauthRequestSuffix]) {
+        return NO;
+    }
+    [self markStarting];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BOOL taken = [self waitForRequestFileTaken:ReauthRequestSuffix timeout:kReauthRequestTimeout];
+        if (!taken) {
+            // An older minieap that does not poll for requests
+            [self removeRequestFileWithSuffix:ReauthRequestSuffix];
+        }
+        BOOL running = [self miniEAPRunning];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BOOL stopAfterStart = self.stopRequestedWhileStarting;
+            BOOL quitAfterStop = self.terminatingAfterStop;
+            self.starting = NO;
+            self.wasRunningLastTick = running;
+            if (stopAfterStart) {
+                self.stopRequestedWhileStarting = NO;
+                [self stopAuthThenQuit:quitAfterStop force:YES];
+                return;
+            }
+            if (!taken || !running) {
+                [self startAuthWithNetworkRepair:YES allowInPlace:NO];
+                return;
+            }
+            [self updateStatus];
+        });
+    });
+    return YES;
+}
+
+- (void)startAuthWithNetworkRepair:(BOOL)repairNetwork allowInPlace:(BOOL)allowInPlace {
     if (self.starting) {
         return;
     }
     self.userWantsConnected = YES;
     if (!repairNetwork && [self miniEAPRunning]) {
         [self updateStatus];
+        return;
+    }
+    if (repairNetwork && allowInPlace && [self requestInPlaceReauth]) {
         return;
     }
     if (![self minieapPath].length) {
@@ -947,6 +1075,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
             self.wasRunningLastTick = running;
             if (running) {
                 self.lastStartError = nil;
+                [[NSUserDefaults standardUserDefaults] setObject:iface forKey:PrefRunningInterface];
             } else if (stopAfterStart) {
                 self.lastStartError = nil;
             } else if ([result[@"ok"] boolValue]) {
@@ -954,7 +1083,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
                 // whether it survived its own startup (bad interface, pcap error).
                 self.lastStartError = @"认证进程启动后立即退出";
                 self.userWantsConnected = NO;
-                [self showMessage:@"认证进程启动后立即退出了，请在菜单里“打开日志文件夹”查看原因。"];
+                [self showMessage:[self messageWithLoggedProblem:@"认证进程启动后立即退出了，详细信息可在菜单里“打开日志文件夹”查看。"]];
             } else {
                 self.lastStartError = result[@"message"] ?: @"未知错误";
                 self.userWantsConnected = NO;
@@ -1003,9 +1132,17 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
     self.stopping = YES;
     [self updateStatus];
     NSString *command = [self stopCommand];
+    BOOL requested = [self miniEAPRunning] && [self writeRequestFileWithSuffix:StopRequestSuffix];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSDictionary *result = [self runAdminShell:command];
-        BOOL stopped = [self waitForMiniEAPStoppedWithTimeout:3.0];
+        // minieap sends its Logoff and exits by itself on a stop request, so
+        // stopping and quitting normally need no administrator prompt at all.
+        BOOL stopped = requested && [self waitForMiniEAPStoppedWithTimeout:kStopRequestTimeout];
+        NSDictionary *result = @{@"ok": @YES};
+        if (!stopped) {
+            [self removeRequestFileWithSuffix:StopRequestSuffix];
+            result = [self runAdminShell:command];
+            stopped = [self waitForMiniEAPStoppedWithTimeout:3.0];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             self.stopping = NO;
             if (!stopped || ![result[@"ok"] boolValue]) {
@@ -1089,7 +1226,21 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         [self showMessage:[NSString stringWithFormat:@"保存到钥匙串失败（错误码 %d），账号密码没有更新。", (int)status]];
         return;
     }
-    [self showMessage:@"校园网账号密码已保存到 macOS 钥匙串。"];
+    if (![self miniEAPRunning] || self.starting || self.stopping) {
+        [self showMessage:@"校园网账号密码已保存到 macOS 钥匙串。"];
+        return;
+    }
+    // The running minieap still holds the old password; it only reads one at launch.
+    [NSApp activateIgnoringOtherApps:YES];
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = AppName;
+    alert.informativeText = @"校园网账号密码已保存到 macOS 钥匙串。正在运行的认证仍在使用旧账号，要现在用新账号重新认证吗？";
+    [alert addButtonWithTitle:@"立即重新认证"];
+    [alert addButtonWithTitle:@"稍后"];
+    if ([alert runModal] == NSAlertFirstButtonReturn) {
+        self.autoRepairUsed = NO;
+        [self startAuthWithNetworkRepair:YES allowInPlace:NO];
+    }
 }
 
 - (void)quit {

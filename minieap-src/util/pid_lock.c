@@ -1,4 +1,5 @@
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
@@ -169,18 +170,18 @@ RESULT pid_lock_destroy() {
 }
 
 // Returns FAILURE only on unexpected I/O error; missing pidfile config is not an error here.
-static int build_online_path(char* buf, size_t buf_size) {
+static int build_companion_path(char* buf, size_t buf_size, const char* suffix) {
     const char* pidfile = get_program_config() ? get_program_config()->pidfile : NULL;
     if (pidfile == NULL || strcmp(pidfile, PID_FILE_NONE) == 0) {
         return FALSE;
     }
-    int written = snprintf(buf, buf_size, "%s%s", pidfile, ONLINE_SUFFIX);
+    int written = snprintf(buf, buf_size, "%s%s", pidfile, suffix);
     return written > 0 && (size_t)written < buf_size;
 }
 
 RESULT pid_lock_mark_online() {
     char online_path[600];
-    if (!build_online_path(online_path, sizeof(online_path))) {
+    if (!build_companion_path(online_path, sizeof(online_path), ONLINE_SUFFIX)) {
         return SUCCESS; // Nothing to mark, not an error
     }
     int open_flags = O_WRONLY | O_CREAT | O_TRUNC;
@@ -198,8 +199,19 @@ RESULT pid_lock_mark_online() {
 
 void pid_lock_clear_online() {
     char online_path[600];
-    if (!build_online_path(online_path, sizeof(online_path))) {
+    if (!build_companion_path(online_path, sizeof(online_path), ONLINE_SUFFIX)) {
         return;
     }
     unlink(online_path);
+}
+
+int pid_lock_take_request(const char* suffix) {
+    char path[600];
+    struct stat info;
+    if (!build_companion_path(path, sizeof(path), suffix)
+            || lstat(path, &info) != 0 || !S_ISREG(info.st_mode)) {
+        return FALSE;
+    }
+    unlink(path);
+    return TRUE;
 }

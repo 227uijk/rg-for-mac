@@ -200,6 +200,25 @@ static void signal_handler(int signal) {
 }
 
 /*
+ * Runs in the SIGALRM handler, like every other scheduled task here, so the
+ * stop path uses the same pcap_breakloop() as signal_handler() above.
+ */
+static void poll_control_requests(void* unused) {
+    if (pid_lock_take_request(PID_LOCK_REQUEST_STOP)) {
+        PR_INFO("收到停止请求，正在退出……");
+        IF_IMPL* _if_impl = get_if_impl();
+        if (_if_impl != NULL) {
+            _if_impl->stop_capture(_if_impl);
+        }
+        return; // No need to keep polling
+    }
+    if (pid_lock_take_request(PID_LOCK_REQUEST_REAUTH) && !eap_state_machine_reauth()) {
+        PR_WARN("暂时无法重新认证，请稍后再试");
+    }
+    schedule_alarm(1, poll_control_requests, NULL);
+}
+
+/*
  * Detailed errors are printed where they happen, not here ...
  */
 int main(int argc, char* argv[]) {
@@ -250,6 +269,12 @@ int main(int argc, char* argv[]) {
         PR_ERR("PID 文件写入失败，认证进程将退出");
         return FAILURE;
     }
+
+    // Leftovers from a previous run must not stop or re-auth this one. Polled
+    // only after daemonizing: pending alarm() timers do not survive fork().
+    pid_lock_take_request(PID_LOCK_REQUEST_STOP);
+    pid_lock_take_request(PID_LOCK_REQUEST_REAUTH);
+    schedule_alarm(1, poll_control_requests, NULL);
 
     switch_to_state(EAP_STATE_PREPARING, NULL);
 

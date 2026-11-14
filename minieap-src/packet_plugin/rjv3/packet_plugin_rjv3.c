@@ -258,7 +258,7 @@ static RESULT rjv3_process_success(struct _packet_plugin* this, ETH_EAP_FRAME* f
     }
 
     PR_INFO("正定时发送 Keep-Alive 报文以保持在线……");
-    schedule_alarm(1, rjv3_send_keepalive_timed, this);
+    rjv3_keepalive_start(this);
     return SUCCESS;
 }
 

@@ -102,5 +102,11 @@ void eap_state_machine_recv_handler(ETH_EAP_FRAME* frame);
  */
 void eap_state_machine_send_logoff();
 
+/*
+ * Log off and authenticate again from scratch, the in-process equivalent of a
+ * stop/start. Returns FALSE (and does nothing) when it cannot run right now.
+ */
+int eap_state_machine_reauth();
+
 #endif
 

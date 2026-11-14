@@ -10,4 +10,5 @@ void rjv3_keepalive_reset();
 
 RESULT rjv3_send_new_keepalive_frame(struct _packet_plugin* this);
 void rjv3_send_keepalive_timed(void* vthis);
+void rjv3_keepalive_start(struct _packet_plugin* this);
 #endif

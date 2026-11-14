@@ -115,3 +115,10 @@ void rjv3_send_keepalive_timed(void* vthis) {
     }
     g_keepalive_alarm_id = schedule_alarm(PRIV->heartbeat_interval, rjv3_send_keepalive_timed, vthis);
 }
+
+// A re-auth while already online (server re-requesting identity, or a
+// requested re-auth) used to start a second, independent heartbeat chain.
+void rjv3_keepalive_start(struct _packet_plugin* this) {
+    unschedule_alarm(g_keepalive_alarm_id);
+    g_keepalive_alarm_id = schedule_alarm(1, rjv3_send_keepalive_timed, this);
+}

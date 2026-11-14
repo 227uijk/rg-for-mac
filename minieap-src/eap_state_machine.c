@@ -245,12 +245,17 @@ static RESULT state_mach_process_success(ETH_EAP_FRAME* frame) {
     }
 }
 
+// Set between a requested re-auth's Logoff and its fresh Start, so the Failure
+// some servers answer a Logoff with is not taken for a drop and retried twice.
+static int g_reauth_pending = 0;
+
 static void restart_auth(void* unused) {
     // eap_state_machine_reset() zeroes fail_count, which used to mean every
     // retry started counting from 0 again and --max-fail could never trigger:
     // a wrong password kept retrying forever. Only a success clears it now.
     int _fail_count = PRIV->fail_count;
     g_retry_alarm_id = 0;
+    g_reauth_pending = 0;
     eap_state_machine_reset();
     PRIV->fail_count = _fail_count;
     switch_to_state(EAP_STATE_START_SENT, NULL);
@@ -258,6 +263,9 @@ static void restart_auth(void* unused) {
 
 static RESULT state_mach_process_failure(ETH_EAP_FRAME* frame) {
     PROG_CONFIG* _cfg = get_program_config();
+    if (g_reauth_pending) {
+        return SUCCESS; // Our own Logoff being acknowledged; the restart is already scheduled
+    }
     if (PRIV->state == EAP_STATE_SUCCESS) {
         /* Server forced us offline, not auth failing */
         pid_lock_clear_online(); // No longer truly online, whether we retry or exit next
@@ -281,6 +289,23 @@ static RESULT state_mach_process_failure(ETH_EAP_FRAME* frame) {
         }
     }
     return SUCCESS;
+}
+
+int eap_state_machine_reauth() {
+    if (PRIV->packet_builder == NULL || g_in_capture_callback) {
+        return FALSE;
+    }
+    PR_INFO("收到重新认证请求，正在下线并重新认证");
+    pid_lock_clear_online();
+    disable_state_watchdog();
+    unschedule_alarm(g_retry_alarm_id);
+    if (g_ever_sent_start) {
+        state_mach_send_eapol_simple(EAPOL_LOGOFF);
+    }
+    PRIV->fail_count = 0; // A fresh attempt the user asked for, not another strike
+    g_reauth_pending = 1;
+    g_retry_alarm_id = schedule_alarm(2, restart_auth, NULL);
+    return TRUE;
 }
 
 /*

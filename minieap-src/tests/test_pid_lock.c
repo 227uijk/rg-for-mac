@@ -96,5 +96,25 @@ int main(void) {
 #endif
     unlink(link_path);
     unlink(target_path);
+
+    char req_pid[] = "/tmp/ruijie-pid-lock-req-XXXXXX";
+    int req_fd = mkstemp(req_pid);
+    assert(req_fd >= 0);
+    close(req_fd);
+    test_config.pidfile = req_pid;
+    char req_path[600];
+    snprintf(req_path, sizeof(req_path), "%s%s", req_pid, PID_LOCK_REQUEST_STOP);
+    assert(pid_lock_take_request(PID_LOCK_REQUEST_STOP) == FALSE);
+    int stop_fd = open(req_path, O_WRONLY | O_CREAT, 0644);
+    assert(stop_fd >= 0);
+    close(stop_fd);
+    assert(pid_lock_take_request(PID_LOCK_REQUEST_REAUTH) == FALSE);
+    assert(pid_lock_take_request(PID_LOCK_REQUEST_STOP) == TRUE);
+    assert(access(req_path, F_OK) != 0);
+    assert(pid_lock_take_request(PID_LOCK_REQUEST_STOP) == FALSE);
+    assert(symlink(req_pid, req_path) == 0);
+    assert(pid_lock_take_request(PID_LOCK_REQUEST_STOP) == FALSE); // Not a regular file
+    unlink(req_path);
+    unlink(req_pid);
     return 0;
 }
