@@ -212,8 +212,14 @@ static void poll_control_requests(void* unused) {
         }
         return; // No need to keep polling
     }
-    if (pid_lock_take_request(PID_LOCK_REQUEST_REAUTH) && !eap_state_machine_reauth()) {
-        PR_WARN("暂时无法重新认证，请稍后再试");
+    if (pid_lock_request_pending(PID_LOCK_REQUEST_REAUTH)) {
+        // Inside a capture callback the re-auth can't run yet; leave the file
+        // so the next poll tries again instead of silently dropping it.
+        if (pid_lock_take_request(PID_LOCK_REQUEST_REAUTH)
+                && !eap_state_machine_reauth()) {
+            PR_WARN("暂时无法重新认证，稍后重试");
+            pid_lock_write_request(PID_LOCK_REQUEST_REAUTH);
+        }
     }
     schedule_alarm(1, poll_control_requests, NULL);
 }

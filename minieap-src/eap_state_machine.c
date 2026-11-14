@@ -227,10 +227,15 @@ void eap_state_machine_send_logoff() {
 // fire later and restart an auth that already went through.
 static int g_retry_alarm_id = 0;
 
+// Set between a requested re-auth's Logoff and its fresh Start, so the Failure
+// some servers answer a Logoff with is not taken for a drop and retried twice.
+static int g_reauth_pending = 0;
+
 static RESULT state_mach_process_success(ETH_EAP_FRAME* frame) {
     PROG_CONFIG* _cfg = get_program_config();
     unschedule_alarm(g_retry_alarm_id);
     g_retry_alarm_id = 0;
+    g_reauth_pending = 0; // A Success that lands inside the re-auth delay finishes it; nothing left to shield
     if (PRIV->auth_round == _cfg->auth_round) {
         PR_INFO("认证成功");
         pid_lock_mark_online(); // Let outside supervisors know we are truly online now
@@ -244,10 +249,6 @@ static RESULT state_mach_process_success(ETH_EAP_FRAME* frame) {
         return SUCCESS;
     }
 }
-
-// Set between a requested re-auth's Logoff and its fresh Start, so the Failure
-// some servers answer a Logoff with is not taken for a drop and retried twice.
-static int g_reauth_pending = 0;
 
 static void restart_auth(void* unused) {
     // eap_state_machine_reset() zeroes fail_count, which used to mean every
@@ -396,7 +397,11 @@ static RESULT trans_to_preparing(ETH_EAP_FRAME* frame) {
         // with no network until a manual stop/start sends the Logoff for us.
         PR_INFO("正在发送 EAPOL-Logoff 清除服务器上可能残留的旧会话");
         state_mach_send_eapol_simple(EAPOL_LOGOFF);
-        sleep(2);
+        // Keep the grace period even when a SIGALRM timer interrupts sleep().
+        unsigned int logoff_wait_left = 2;
+        while (logoff_wait_left > 0) {
+            logoff_wait_left = sleep(logoff_wait_left);
+        }
     }
     RESULT ret = switch_to_state(EAP_STATE_START_SENT, frame);
     _if_impl->start_capture(_if_impl); // Blocking...

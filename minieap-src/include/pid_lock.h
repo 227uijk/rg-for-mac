@@ -24,5 +24,7 @@ void pid_lock_clear_online();
 #define PID_LOCK_REQUEST_STOP ".stop"
 #define PID_LOCK_REQUEST_REAUTH ".reauth"
 int pid_lock_take_request(const char* suffix);
+int pid_lock_request_pending(const char* suffix);
+int pid_lock_write_request(const char* suffix);
 
 #endif

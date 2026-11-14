@@ -205,6 +205,30 @@ void pid_lock_clear_online() {
     unlink(online_path);
 }
 
+int pid_lock_write_request(const char* suffix) {
+    char path[600];
+    int open_flags = O_WRONLY | O_CREAT | O_TRUNC;
+#ifdef O_NOFOLLOW
+    open_flags |= O_NOFOLLOW;
+#endif
+    if (!build_companion_path(path, sizeof(path), suffix)) {
+        return FAILURE;
+    }
+    int fd = open(path, open_flags, 0644);
+    if (fd < 0) {
+        return FAILURE;
+    }
+    close(fd);
+    return SUCCESS;
+}
+
+int pid_lock_request_pending(const char* suffix) {
+    char path[600];
+    struct stat info;
+    return build_companion_path(path, sizeof(path), suffix)
+        && lstat(path, &info) == 0 && S_ISREG(info.st_mode);
+}
+
 int pid_lock_take_request(const char* suffix) {
     char path[600];
     struct stat info;
