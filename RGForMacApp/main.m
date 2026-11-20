@@ -1354,7 +1354,7 @@ static void DynamicStoreChanged(SCDynamicStoreRef store, CFArrayRef changedKeys,
         "if [ -z \"$MINIEAP_PASSWORD\" ]; then echo '无法读取临时密码文件' >&2; exit 1; fi\n"
         "export MINIEAP_PASSWORD\n"
         "export MINIEAP_REQUIRE_EXISTING_FILES=1\n"
-        "%@ --if-impl libpcap --module rjv3 -u %@ --password-env MINIEAP_PASSWORD -n %@ -a 1 -d 2 --heartbeat 30 --logoff-first --max-fail %ld --max-retries 0 --wait-after-fail %ld --version-str %@ --rj-option %@ --fake-dns1 %@ --fake-dns2 %@ --dhcp-script %@ --daemonize 3 --log-file %@ --pid-file %@ --conf-file /dev/null >/dev/null 2>&1 &\n",
+        "%@ --if-impl libpcap --module rjv3 -u %@ --password-env MINIEAP_PASSWORD -n %@ -a 1 -d 1 --heartbeat 30 --logoff-first --max-fail %ld --max-retries 0 --wait-after-fail %ld --version-str %@ --rj-option %@ --fake-dns1 %@ --fake-dns2 %@ --dhcp-script %@ --daemonize 3 --log-file %@ --pid-file %@ --conf-file /dev/null >/dev/null 2>&1 &\n",
         [self stopCommand],
         networkRepairPrefix,
         passwordFile, passwordFile, passwordFile,
