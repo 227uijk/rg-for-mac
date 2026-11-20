@@ -515,8 +515,15 @@ void rjv3_start_secondary_auth(void* vthis) {
         return;
     } else {
         PR_INFO("DHCP 完成，正在开始第二次认证");
-        free_frame(&PRIV->duplicated_packet); // Duplicated in process_success
+        /* When we run as a scheduled retry, the state machine's reset after
+         * the first Success already freed the frame last_recv_packet points
+         * to, and building the second START would read freed memory. The
+         * duplicate kept since process_success still describes that request,
+         * so lend it to last_recv_packet just for the send. */
+        PRIV->last_recv_packet = PRIV->duplicated_packet;
         switch_to_state(EAP_STATE_START_SENT, NULL);
+        free_frame(&PRIV->duplicated_packet); // Duplicated in process_success
+        PRIV->last_recv_packet = NULL;
         return;
     }
 }

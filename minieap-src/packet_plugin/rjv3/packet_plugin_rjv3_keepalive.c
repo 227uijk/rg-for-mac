@@ -10,6 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 #include <pcap.h>
 
 /*
@@ -33,6 +34,9 @@
 static uint32_t g_echokey;
 static uint32_t g_echono;
 static uint8_t g_dest_mac[6];
+// The main thread rewrites these on re-auth (rjv3_process_result_prop) while
+// the heartbeat thread builds frames from them.
+static pthread_mutex_t g_ka_params_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* 独立心跳线程状态 */
 static pthread_t g_ka_thread;
@@ -43,15 +47,21 @@ static char g_ka_ifname[IFNAMSIZ] = {0};
 static uint8_t g_ka_src_mac[6];
 
 void rjv3_set_keepalive_echokey(uint32_t key) {
+    pthread_mutex_lock(&g_ka_params_lock);
     g_echokey = key;
+    pthread_mutex_unlock(&g_ka_params_lock);
 }
 
 void rjv3_set_keepalive_echono(uint32_t no) {
+    pthread_mutex_lock(&g_ka_params_lock);
     g_echono = no;
+    pthread_mutex_unlock(&g_ka_params_lock);
 }
 
 void rjv3_set_keepalive_dest_mac(uint8_t* mac) {
+    pthread_mutex_lock(&g_ka_params_lock);
     memmove(g_dest_mac, mac, 6);
+    pthread_mutex_unlock(&g_ka_params_lock);
 }
 
 void rjv3_keepalive_reset() {
@@ -70,9 +80,13 @@ static int build_keepalive_frame(uint8_t* out) {
     };
     uint8_t _body[27];
     uint8_t* _p = out;
-    uint32_t _num1 = g_echokey + g_echono;
-    uint32_t _num2 = g_echono++;
-
+    uint8_t _dest[6];
+    uint32_t _num1, _num2;
+    pthread_mutex_lock(&g_ka_params_lock);
+    memmove(_dest, g_dest_mac, 6);
+    _num1 = g_echokey + g_echono;
+    _num2 = g_echono++;
+    pthread_mutex_unlock(&g_ka_params_lock);
     memmove(_body, _tpl, sizeof(_body));
     _body[6]  = (uint8_t)~bit_reverse((_num1 >> 24) & 0xff);
     _body[7]  = (uint8_t)~bit_reverse((_num1 >> 16) & 0xff);
@@ -83,7 +97,7 @@ static int build_keepalive_frame(uint8_t* out) {
     _body[18] = (uint8_t)~bit_reverse((_num2 >> 8) & 0xff);
     _body[19] = (uint8_t)~bit_reverse(_num2 & 0xff);
 
-    memmove(_p, g_dest_mac, 6);   _p += 6;   /* 目的 MAC：服务端 */
+    memmove(_p, _dest, 6);        _p += 6;   /* 目的 MAC：服务端 */
     memmove(_p, g_ka_src_mac, 6); _p += 6;   /* 源 MAC：本机网卡 */
     *_p++ = 0x88; *_p++ = 0x8e;              /* EtherType：EAPOL */
     *_p++ = 0x01;                            /* EAPOL version = 1 */
@@ -95,6 +109,14 @@ static int build_keepalive_frame(uint8_t* out) {
 }
 
 static void* ka_thread_main(void* unused) {
+    // Threads inherit the creator's signal mask; when we are created inside a
+    // packet-receive callback SIGALRM is unblocked and the alarm handler would
+    // run auth callbacks on this thread, racing the main thread's packet work.
+    sigset_t _alarms;
+    sigemptyset(&_alarms);
+    sigaddset(&_alarms, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &_alarms, NULL);
+
     char _errbuf[PCAP_ERRBUF_SIZE] = {0};
     pcap_t* _handle = pcap_open_live(g_ka_ifname, 64, 0, 200, _errbuf);
 
